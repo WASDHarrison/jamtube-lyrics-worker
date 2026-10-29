@@ -109,6 +109,27 @@ class Separator:
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
 
+    def load(self, how):
+        """The model `how` says ({ separator, model, overlap }), downloaded the first time and
+        loaded, if it isn't already. Demucs loads its own each time (see demucs)."""
+        if how['separator'] != 'mdx':
+            return
+        key = (how['separator'], how['model'], how['overlap'])
+        if self.loaded and self.loaded[0] == key:
+            return
+        from audio_separator.separator import Separator as AudioSeparator
+        separator = AudioSeparator(
+            output_dir=self.out_dir,
+            model_file_dir=self.models_dir,
+            output_format='FLAC',
+            output_single_stem='Instrumental',
+            mdx_params={'hop_length': 1024, 'segment_size': 256, 'overlap': how['overlap'], 'batch_size': 1,
+                        'enable_denoise': False},
+        )
+        log(f"Loading {how['model']} (downloaded into {self.models_dir} the first time)")
+        separator.load_model(model_filename=how['model'])
+        self.loaded = (key, separator)
+
     def instrumental(self, job, source):
         """The instrumental of `source` (FLAC), as a FLAC file, removed once it's sent."""
         empty(self.out_dir)
@@ -116,20 +137,7 @@ class Separator:
             return self.demucs(job, source)
         if job['separator'] != 'mdx':
             raise RuntimeError(f"Unknown separator: {job['separator']}")
-        how = (job['separator'], job['model'], job['overlap'])
-        if not self.loaded or self.loaded[0] != how:
-            from audio_separator.separator import Separator as AudioSeparator
-            separator = AudioSeparator(
-                output_dir=self.out_dir,
-                model_file_dir=self.models_dir,
-                output_format='FLAC',
-                output_single_stem='Instrumental',
-                mdx_params={'hop_length': 1024, 'segment_size': 256, 'overlap': job['overlap'], 'batch_size': 1,
-                            'enable_denoise': False},
-            )
-            log(f"Loading {job['model']} (downloaded into {self.models_dir} the first time)")
-            separator.load_model(model_filename=job['model'])
-            self.loaded = (how, separator)
+        self.load(job)
         for name in self.loaded[1].separate(source):
             path = name if os.path.isabs(name) else os.path.join(self.out_dir, name)
             if 'instrumental' in os.path.basename(path).lower() and os.path.exists(path):
@@ -234,9 +242,19 @@ def main():
     separator = Separator(args.models_dir, os.path.join(scratch, 'out'))
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
     failures = 0
+    ready = False  # the server's model loaded (see Separator.load), before its first song
     try:
         while True:
             try:
+                if not ready:
+                    status, body = server.request('GET', '/workers/separator')
+                    if status == 200:
+                        try:
+                            separator.load(json.loads(body))
+                            log('Ready for songs.')
+                        except Exception as error:  # the first song tries again
+                            log(f"Couldn't get the model ready ({str(error)[:300]}): the first song will try again.")
+                    ready = status < 500  # an older server (404) doesn't say: the first song loads it
                 status, body = server.request('POST', '/workers/jobs/next', body=me, timeout=POLL_TIMEOUT_SECONDS)
             except OSError as error:
                 wait = RETRY_SECONDS[min(failures, len(RETRY_SECONDS) - 1)]

@@ -4,7 +4,7 @@ Takes the vocals out of songs for a [JamTube Lyrics](https://github.com/WASDHarr
 
 Run as many workers as you like, wherever you like: your laptop, a gaming PC, a cloud GPU for the night. Each one connects to the server, asks for a song, takes its vocals out, sends the result back and asks for the next. The server gives each song to a free worker, soonest-needed first, and does it itself when none is free. If a worker fails, is stopped or goes quiet (switched off, lost its connection), its song goes to another worker, or back to the server. So a worker can come and go at any time, and nothing breaks.
 
-A worker keeps nothing: each song is downloaded into the worker's own temporary folder and deleted once it's sent back, and the folder goes when the worker stops. (A worker killed outright, without the chance to stop, leaves its folder to the system, which clears temporary files; a cloud machine or container takes it with it.) Only the model (about 60 MB) is kept, so it's downloaded once. It removes the vocals exactly as the server would, with the same separator, model and settings, which the server sends with each song. The result is the same, sample for sample.
+A worker keeps nothing: each song is downloaded into the worker's own temporary folder and deleted once it's sent back, and the folder goes when the worker stops. (A worker killed outright, without the chance to stop, leaves its folder to the system, which clears temporary files; a cloud machine or container takes it with it.) Only the model (about 60 MB) is kept, so it's downloaded once. A worker gets it ready as soon as it starts (it asks the server which model it uses), and says "Ready for songs.", so its first song doesn't wait for it. It removes the vocals exactly as the server would, with the same separator, model and settings, which the server sends with each song. The result is the same, sample for sample.
 
 ## On the server
 
@@ -74,6 +74,7 @@ How often a worker checks in, and how long one can go quiet before its song goes
 
 Plain HTTPS, always started by the worker. It works behind home routers, firewalls and cloud networks with nothing opened on the worker's side.
 
+- `GET /workers/separator`: how the server removes vocals (`{ separator, model, overlap }`), so the worker can get the model ready when it starts.
 - `POST /workers/jobs/next` `{ name }`: asks for a song. The server holds the request until it has one (up to `WORKER_POLL_SECONDS`), and answers `204` when it has none, so the worker asks again. A worker waiting here is free.
 - `GET /workers/jobs/:id/audio`: the song's parts to take the vocals out of (FLAC, lossless, 16-bit, 44.1 kHz).
 - `POST /workers/jobs/:id/heartbeat`: every `heartbeatSeconds` while on it. `410` means the server doesn't want it anymore (the song was dropped, or went elsewhere), so the worker drops it.
