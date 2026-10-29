@@ -8,53 +8,48 @@ A worker keeps nothing: each song is downloaded into the worker's own temporary 
 
 ## On the server
 
-Set `WORKER_KEY` in JamTube Lyrics' `.env` to a long random secret (`openssl rand -hex 32`), and restart it. Workers then connect with that key. The server also has to be reachable from where the workers are. By default it only listens on its own machine (`HOST=127.0.0.1`). Either set `HOST=0.0.0.0` and open its port, or better, put it behind your web server with HTTPS (the same way as JamTube), at an address like `https://lyrics.example.com`. Only the `/workers` addresses need to be reachable, and they only work with `WORKER_KEY`.
+Set `WORKER_KEY` in JamTube Lyrics' `.env` to a long random secret (`openssl rand -hex 32`), and restart it. The server also has to be reachable from where the workers are. By default it only listens on its own machine (`HOST=127.0.0.1`). Either put it behind your web server with HTTPS (the same way as JamTube), at an address like `https://lyrics.example.com`, or set `HOST=0.0.0.0` and open its port. Only the `/workers` addresses need to be reachable, and they only work with `WORKER_KEY`. Behind a web server, have it pass on `X-Forwarded-Proto` (nginx: `proxy_set_header X-Forwarded-Proto $scheme;`), so workers started from the server are given its `https://` address.
+
+Workers start from the server, which hands out this worker: keep a copy of this repository next to JamTube Lyrics' folder (`git clone` it beside it, and `git pull` it when you update the server), or say where it is with `WORKER_FILES_DIR`.
 
 `GET /health` on the server lists the workers connected right now (`workers`).
 
-## Running a worker
+## Starting a worker
 
-The worker needs the server's address and its `WORKER_KEY`, as `--server` and `--key`, or as the environment variables `JAMTUBE_LYRICS_URL` and `WORKER_KEY`. `--name` (or `WORKER_NAME`) is what the server calls it, which defaults to the computer's name. It shows in the server's log and in each song's Song Info ("Vocal separator: …, on gaming-pc").
-
-The first run sets everything up in a `.venv` folder here, with the GPU build when there's an NVIDIA GPU. Later runs start straight away. It needs Python 3.10 to 3.13, and ffmpeg. It says what it's running on when it starts: an NVIDIA GPU (CUDA), a Mac's GPU (Core ML), or the CPU.
+One line, on any computer, with nothing to install first. It gets the worker from the server, sets everything up the first time (a few minutes: Python, and what vocal removal needs, a few GB, with the GPU build when there's an NVIDIA GPU) and starts it. After that, the same line starts it in seconds, with the server's latest worker.
 
 **macOS or Linux**
 
 ```sh
-git clone https://github.com/WASDHarrison/jamtube-lyrics-worker && cd jamtube-lyrics-worker
-./run.sh --server https://lyrics.example.com --key <WORKER_KEY>
+curl -fsSL https://lyrics.example.com/workers/start/<WORKER_KEY> | sh
 ```
-
-On a Mac, get them with Homebrew: `brew install python@3.12 ffmpeg`. Apple Silicon Macs use their GPU (Metal) automatically.
 
 **Windows** (PowerShell)
 
 ```powershell
-git clone https://github.com/WASDHarrison/jamtube-lyrics-worker; cd jamtube-lyrics-worker
-powershell -ExecutionPolicy Bypass -File run.ps1 --server https://lyrics.example.com --key <WORKER_KEY>
+irm https://lyrics.example.com/workers/start/<WORKER_KEY> | iex
 ```
 
-Get them with `winget install Python.Python.3.12 Gyan.FFmpeg`, then open a new window.
+Stop it with Ctrl+C: a song it was working on goes straight to another worker or back to the server. Options go after it: `... | sh -s -- --name gaming-pc` on macOS and Linux.
+
+It says what it's running on when it starts: an NVIDIA GPU (CUDA), a Mac's GPU (Core ML), or the CPU. Everything goes in one folder, `~/.jamtube-lyrics-worker` (Windows: `%LOCALAPPDATA%\jamtube-lyrics-worker`; or `JAMTUBE_WORKER_DIR`): [uv](https://docs.astral.sh/uv/) and the Python it brings, what the worker needs, ffmpeg if the computer has none, and the model. Deleting the folder removes the worker completely.
+
+**From a copy of this repository** (no server to get it from): `./run.sh --server https://lyrics.example.com --key <WORKER_KEY>`, or on Windows `powershell -ExecutionPolicy Bypass -File run.ps1 --server ... --key ...`. It's the same script, keeping everything in this folder.
 
 **Cloud machines**
 
-On a GPU machine you rent by the hour, the worker is the only thing to start, and it's fine to switch the machine off at any time: its song goes to another worker or back to the server.
+The worker is ready to run as a container: `ghcr.io/wasdharrison/jamtube-lyrics-worker`, `latest` for an NVIDIA GPU and `cpu` without one, built from `main` on every push. It's private like this repository, so a machine first logs in with a GitHub token that can read packages (a classic personal access token with `read:packages`): `docker login ghcr.io -u WASDHarrison` and the token as the password.
 
-- **GCP, AWS, Azure** (a VM with an NVIDIA GPU): use a "deep learning" or GPU-ready image (it has the NVIDIA driver and Docker with GPU support), then build and run the container below. Or, on any Linux VM with the NVIDIA driver, clone this and use `./run.sh`.
-- **Vast.ai, RunPod** and the like: their machines are containers already, usually with PyTorch and Python. Pick an image with CUDA, open its terminal, install ffmpeg (`apt-get install -y ffmpeg`), clone this and use `./run.sh`.
-
-**Docker**
+- **Vast.ai, RunPod** and the like: make a template with the image `ghcr.io/wasdharrison/jamtube-lyrics-worker`, the environment variables `JAMTUBE_LYRICS_URL` and `WORKER_KEY`, and the registry login (`ghcr.io`, your GitHub name and the token). A machine rented with it starts working as soon as it's up, and it's fine to destroy it any time: its song goes to another worker or back to the server. Or rent any machine with a terminal and use the one line above.
+- **GCP, AWS, Azure** (a VM with an NVIDIA GPU): use a GPU-ready image (it has the NVIDIA driver and Docker with GPU support), log in as above, then:
 
 ```sh
-docker build -t jamtube-lyrics-worker .
 docker run -d --restart unless-stopped --gpus all \
   -e JAMTUBE_LYRICS_URL=https://lyrics.example.com -e WORKER_KEY=<WORKER_KEY> -e WORKER_NAME=cloud-gpu \
-  -v jamtube-models:/models jamtube-lyrics-worker
+  -v jamtube-models:/models ghcr.io/wasdharrison/jamtube-lyrics-worker
 ```
 
-That's for an NVIDIA GPU, which needs the NVIDIA Container Toolkit; GPU images on the clouds usually have it. Without a GPU: `docker build --build-arg KIND=cpu -t jamtube-lyrics-worker:cpu .`, and leave out `--gpus all`. The volume keeps the model between runs. Without it, the model is downloaded each time the container starts.
-
-Stop a worker with Ctrl+C (or `docker stop`): a song it was working on goes straight to another worker or back to the server.
+`--gpus all` needs the NVIDIA Container Toolkit, which GPU images on the clouds have. Without a GPU, use the `cpu` image and leave out `--gpus all`. The volume keeps the model between runs; without it, the model is downloaded each time the container starts. Stop it with `docker stop`. To build the image yourself: `docker build -t jamtube-lyrics-worker .` (without a GPU: `--build-arg KIND=cpu`).
 
 ## Settings
 
@@ -63,7 +58,15 @@ Stop a worker with Ctrl+C (or `docker stop`): a song it was working on goes stra
 | `--server` | `JAMTUBE_LYRICS_URL` | | The server's address. |
 | `--key` | `WORKER_KEY` | | The server's `WORKER_KEY`. |
 | `--name` | `WORKER_NAME` | the computer's name | What the server calls it. |
-| `--models-dir` | `MODELS_DIR` | the user's cache folder | Where the model is kept between runs. |
+| `--models-dir` | `MODELS_DIR` | `models`, in its folder | Where the model is kept between runs. |
+
+And for the start script (`run.sh`, `run.ps1`):
+
+| Environment | Default | |
+|---|---|---|
+| `JAMTUBE_WORKER_DIR` | `~/.jamtube-lyrics-worker` (Windows: `%LOCALAPPDATA%\jamtube-lyrics-worker`) | Its folder, started from the server. |
+| `PYTHON_VERSION` | `3.12` | The Python it runs on (3.10 to 3.13). |
+| `UV_INSTALLER` | uv's installer from astral.sh | Where it gets uv the first time. |
 
 How often a worker checks in, and how long one can go quiet before its song goes elsewhere, are set on the server (`WORKER_POLL_SECONDS`, `WORKER_HEARTBEAT_SECONDS`, `WORKER_TIMEOUT_SECONDS`; see its README).
 
@@ -83,9 +86,10 @@ Each needs `Authorization: Bearer <WORKER_KEY>`.
 
 ```
 worker.py               The worker
-run.sh                  Sets it up and runs it on macOS and Linux
+run.sh                  Sets it up and starts it on macOS and Linux (what the server hands out)
 run.ps1                 The same on Windows
 requirements-cpu.txt    What it needs without an NVIDIA GPU (Macs too)
 requirements-gpu.txt    What it needs with one (CUDA)
 Dockerfile              The worker in a container, GPU or CPU
+.github/workflows/      Builds the container image on every push to main
 ```

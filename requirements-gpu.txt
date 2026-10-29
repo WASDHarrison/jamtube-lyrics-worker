@@ -1,4 +1,8 @@
-# What the worker needs with an NVIDIA GPU (CUDA).
+# What the worker needs with an NVIDIA GPU (CUDA). PyTorch's CUDA build: vocal removal only uses
+# the GPU when PyTorch can, and PyPI's PyTorch for Windows has no CUDA.
+--extra-index-url https://download.pytorch.org/whl/cu128
 audio-separator[gpu]
 # audio-separator uses audioread without asking for it (it used to come with librosa).
 audioread
+# ffmpeg, for computers without it.
+imageio-ffmpeg

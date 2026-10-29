@@ -1,40 +1,59 @@
 #!/bin/sh
-# Runs a worker on macOS or Linux, setting it up the first time (a Python environment in .venv,
-# with the GPU build when there's an NVIDIA GPU). Anything after it goes to worker.py:
+# Starts a worker on macOS or Linux, setting everything up the first time, with nothing to install
+# first. Straight from the server, which fills in its address and key:
 #
-#   ./run.sh --server https://lyrics.example.com --key <WORKER_KEY>
+#   curl -fsSL https://lyrics.example.com/workers/start/<WORKER_KEY> | sh
 #
-# (or set JAMTUBE_LYRICS_URL and WORKER_KEY). PYTHON picks the Python to use.
-set -e
-cd "$(dirname "$0")"
+# or from a copy of this folder: ./run.sh --server https://lyrics.example.com --key <WORKER_KEY>
+# Anything after it goes to worker.py (from the server: ... | sh -s -- --name gaming-pc).
+#
+# It all goes in one folder: this one, or from the server ~/.jamtube-lyrics-worker
+# (JAMTUBE_WORKER_DIR). uv, the Python it brings, what the worker needs and the model. Deleting
+# the folder removes the worker.
 
-if [ ! -x .venv/bin/python ]; then
-  # A Python the vocal removal works with (3.10 to 3.13), newest first.
-  for candidate in "$PYTHON" python3.13 python3.12 python3.11 python3.10 python3; do
-    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1 \
-      && "$candidate" -c 'import sys; sys.exit(not (3, 10) <= sys.version_info[:2] <= (3, 13))'; then
-      PYTHON=$candidate
-      break
-    fi
-  done
-  if [ -z "$PYTHON" ] || ! command -v "$PYTHON" >/dev/null 2>&1; then
-    echo "Needs Python 3.10 to 3.13 (macOS: brew install python@3.12; Linux: your package manager)." >&2
-    exit 1
+# The server fills these in when it hands this script out.
+SERVER=''
+KEY=''
+
+PYTHON_VERSION=${PYTHON_VERSION:-3.12} # the Python vocal removal runs on (3.10 to 3.13)
+UV_INSTALLER=${UV_INSTALLER:-https://astral.sh/uv/install.sh}
+
+# All in a function, so it's all been read before it starts (it's read from a pipe).
+main() {
+  set -e
+  if [ -n "$SERVER" ]; then
+    DIR=${JAMTUBE_WORKER_DIR:-$HOME/.jamtube-lyrics-worker}
+    mkdir -p "$DIR"
+    echo "Getting the worker from $SERVER"
+    for file in worker.py requirements-cpu.txt requirements-gpu.txt; do
+      curl -fsSL -H "Authorization: Bearer $KEY" "$SERVER/workers/files/$file" -o "$DIR/$file"
+    done
+    set -- --server "$SERVER" --key "$KEY" "$@"
+  else
+    DIR=$(cd "$(dirname "$0")" && pwd)
   fi
-  "$PYTHON" -m venv .venv
-fi
+  cd "$DIR"
 
-if command -v nvidia-smi >/dev/null 2>&1; then KIND=gpu; else KIND=cpu; fi
-if [ ! -f .venv/installed ] || [ "$(cat .venv/installed)" != "$KIND" ] || [ "requirements-$KIND.txt" -nt .venv/installed ]; then
-  echo "Installing what it needs ($KIND), the first time only…"
-  .venv/bin/python -m pip install --quiet --upgrade pip
-  .venv/bin/python -m pip install --quiet -r "requirements-$KIND.txt"
-  echo "$KIND" > .venv/installed
-fi
+  # uv: it brings the right Python and installs what the worker needs, all in this folder.
+  export UV_CACHE_DIR="$DIR/.uv/cache" UV_PYTHON_INSTALL_DIR="$DIR/.uv/python"
+  UV="$DIR/.uv/bin/uv"
+  if [ ! -x "$UV" ]; then
+    echo "Getting uv (it brings Python)"
+    curl -LsSf "$UV_INSTALLER" | env UV_INSTALL_DIR="$DIR/.uv/bin" UV_NO_MODIFY_PATH=1 sh >/dev/null
+  fi
+  if [ ! -x .venv/bin/python ]; then
+    "$UV" venv --quiet --python "$PYTHON_VERSION" .venv
+  fi
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "Needs ffmpeg (macOS: brew install ffmpeg; Linux: your package manager, e.g. apt install ffmpeg)." >&2
-  exit 1
-fi
+  # The GPU build with an NVIDIA GPU. .venv/installed is what was installed last.
+  if command -v nvidia-smi >/dev/null 2>&1; then KIND=gpu; else KIND=cpu; fi
+  if ! cmp -s "requirements-$KIND.txt" .venv/installed; then
+    echo "Installing what it needs ($KIND): the first time only, a few minutes"
+    "$UV" pip install --python .venv/bin/python --index-strategy unsafe-best-match -r "requirements-$KIND.txt"
+    cp "requirements-$KIND.txt" .venv/installed
+  fi
 
-exec .venv/bin/python worker.py "$@"
+  exec .venv/bin/python worker.py "$@"
+}
+
+main "$@"

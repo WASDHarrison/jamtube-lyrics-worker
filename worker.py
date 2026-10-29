@@ -41,15 +41,19 @@ def log(message):
     print(time.strftime('%H:%M:%S'), message, flush=True)
 
 
-def default_models_dir():
-    """Where the model is kept between runs: the user's cache folder."""
-    if platform.system() == 'Windows':
-        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
-    elif platform.system() == 'Darwin':
-        base = os.path.expanduser('~/Library/Caches')
-    else:
-        base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
-    return os.path.join(base, 'jamtube-lyrics-worker')
+def use_ffmpeg():
+    """Vocal removal writes its result with ffmpeg: the computer's own, or else the one that came
+    with the worker (imageio-ffmpeg), put in .ffmpeg here as `ffmpeg` and used from there."""
+    if shutil.which('ffmpeg'):
+        return
+    import imageio_ffmpeg
+    folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.ffmpeg')
+    os.makedirs(folder, exist_ok=True)
+    target = os.path.join(folder, 'ffmpeg.exe' if platform.system() == 'Windows' else 'ffmpeg')
+    if not os.path.exists(target):
+        source = imageio_ffmpeg.get_ffmpeg_exe()
+        shutil.copy(source, target) if platform.system() == 'Windows' else os.symlink(source, target)
+    os.environ['PATH'] = folder + os.pathsep + os.environ.get('PATH', '')
 
 
 def empty(folder):
@@ -188,22 +192,20 @@ def work(server, separator, job, folder):
         empty(separator.out_dir)
 
 
-# What vocal removal can run on, by ONNX Runtime's names for them, best first.
-ACCELERATORS = {
-    'CUDAExecutionProvider': 'an NVIDIA GPU (CUDA)',
-    'CoreMLExecutionProvider': "the Mac's GPU (Core ML)",
-    'DmlExecutionProvider': 'the GPU (DirectML)',
-}
-
-
 def accelerator():
-    """What vocal removal runs on here, in words: the best GPU it can use, or the CPU."""
+    """What vocal removal runs on here, in words, as audio-separator picks it: an NVIDIA GPU when
+    PyTorch can use it, a Mac's GPU on Apple silicon, or else the CPU."""
     try:
         import onnxruntime
-        providers = onnxruntime.get_available_providers()
+        import torch
     except ImportError:
-        providers = []
-    return next((ACCELERATORS[name] for name in ACCELERATORS if name in providers), 'the CPU')
+        return 'the CPU'
+    providers = onnxruntime.get_available_providers()
+    if torch.cuda.is_available() and 'CUDAExecutionProvider' in providers:
+        return 'an NVIDIA GPU (CUDA)'
+    if torch.backends.mps.is_available() and platform.machine() == 'arm64' and 'CoreMLExecutionProvider' in providers:
+        return "the Mac's GPU (Core ML)"
+    return 'the CPU'
 
 
 def main():
@@ -211,7 +213,8 @@ def main():
     parser.add_argument('--server', default=os.environ.get('JAMTUBE_LYRICS_URL', ''), help="The server's address (or JAMTUBE_LYRICS_URL).")
     parser.add_argument('--key', default=os.environ.get('WORKER_KEY', ''), help="The server's WORKER_KEY (or WORKER_KEY).")
     parser.add_argument('--name', default=os.environ.get('WORKER_NAME') or socket.gethostname(), help="What the server calls it (or WORKER_NAME; this computer's name).")
-    parser.add_argument('--models-dir', default=os.environ.get('MODELS_DIR') or default_models_dir(), help='Where the model is kept between runs (or MODELS_DIR).')
+    parser.add_argument('--models-dir', default=os.environ.get('MODELS_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'),
+                        help="Where the model is kept between runs (or MODELS_DIR; models, next to this).")
     args = parser.parse_args()
     if not args.server or not args.key:
         parser.error('Say which server and its WORKER_KEY: --server and --key (or JAMTUBE_LYRICS_URL and WORKER_KEY).')
@@ -222,6 +225,7 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, stopped)
 
+    use_ffmpeg()
     server = Server(args.server, args.key)
     me = {'id': str(uuid.uuid4()), 'name': args.name}  # its own id, so several can share a name
     # This run's one temporary folder: each song, and its vocal removal's output. Gone when it

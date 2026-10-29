@@ -1,10 +1,10 @@
-# A worker in a container, for cloud machines (GCP, AWS, Azure, Vast.ai, RunPod...). With an
-# NVIDIA GPU (the default):
+# A worker in a container, for cloud machines (GCP, AWS, Azure, Vast.ai, RunPod...). Built on
+# every push to main (.github/workflows/image.yml) as ghcr.io/wasdharrison/jamtube-lyrics-worker:
+# `latest` with an NVIDIA GPU, `cpu` without one:
 #
-#   docker build -t jamtube-lyrics-worker .
-#   docker run --gpus all -e JAMTUBE_LYRICS_URL=https://lyrics.example.com -e WORKER_KEY=... jamtube-lyrics-worker
+#   docker run --gpus all -e JAMTUBE_LYRICS_URL=https://lyrics.example.com -e WORKER_KEY=... ghcr.io/wasdharrison/jamtube-lyrics-worker
 #
-# Without one: docker build --build-arg KIND=cpu -t jamtube-lyrics-worker:cpu .
+# Or build it: docker build -t jamtube-lyrics-worker . (without a GPU: --build-arg KIND=cpu)
 # The model is downloaded into /models the first time; mount a volume there to keep it.
 ARG KIND=gpu
 ARG GPU_BASE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04

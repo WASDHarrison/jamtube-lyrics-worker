@@ -1,2 +1,5 @@
 .venv/
+.uv/
+.ffmpeg/
+models/
 __pycache__/

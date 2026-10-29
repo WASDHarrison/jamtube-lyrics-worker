@@ -1,3 +1,7 @@
 .venv/
+.uv/
+.ffmpeg/
+models/
 __pycache__/
 .git/
+.github/

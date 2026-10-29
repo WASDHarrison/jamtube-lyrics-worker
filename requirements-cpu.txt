@@ -4,3 +4,5 @@
 audio-separator[cpu]
 # audio-separator uses audioread without asking for it (it used to come with librosa).
 audioread
+# ffmpeg, for computers without it.
+imageio-ffmpeg
