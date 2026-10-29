@@ -1,0 +1,6 @@
+# What the worker needs without an NVIDIA GPU (Macs too, where it uses Apple's own acceleration).
+# PyTorch's CPU-only build on Linux and Windows: the usual one carries GBs of NVIDIA code.
+--extra-index-url https://download.pytorch.org/whl/cpu
+audio-separator[cpu]
+# audio-separator uses audioread without asking for it (it used to come with librosa).
+audioread

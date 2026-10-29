@@ -1,0 +1,4 @@
+# What the worker needs with an NVIDIA GPU (CUDA).
+audio-separator[gpu]
+# audio-separator uses audioread without asking for it (it used to come with librosa).
+audioread
