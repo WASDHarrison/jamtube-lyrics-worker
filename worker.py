@@ -30,8 +30,9 @@ import urllib.error
 import urllib.request
 import uuid
 
-# Waits before trying the server again while it can't be reached (then the last, again and again).
-RETRY_SECONDS = [1, 2, 5, 10, 30]
+# Waits before trying the server again while it can't be reached (then the last, again and
+# again): soon enough to be back within seconds of a restart, when its songs are waiting.
+RETRY_SECONDS = [1, 2, 3, 5]
 # How long an answer to "a job?" can take: the server holds it until there's one, up to its own
 # WORKER_POLL_SECONDS (25), so this is only for a server that stopped answering.
 POLL_TIMEOUT_SECONDS = 120
