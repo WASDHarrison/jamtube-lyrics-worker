@@ -40,7 +40,7 @@ It says what it's running on when it starts: an NVIDIA GPU (CUDA), a Mac's GPU (
 
 The worker is ready to run as a container: `ghcr.io/wasdharrison/jamtube-lyrics-worker`, `latest` for an NVIDIA GPU and `cpu` without one, built from `main` on every push. It's public, so nothing needs logging in.
 
-- **Vast.ai, RunPod** and the like: make a template with the image `ghcr.io/wasdharrison/jamtube-lyrics-worker:latest`, the environment variables `JAMTUBE_LYRICS_URL`, `WORKER_KEY` and `WORKER_NAME`, the launch mode that runs the image's own command (Vast.ai: Docker ENTRYPOINT), and 25 GB of disk (the image is about 10 GB). Pick a machine whose CUDA is 12.8 or newer; one RTX 3060 is plenty. A machine rented with it starts working as soon as it's up, and it's fine to destroy it any time: its song goes to another worker or back to the server. Or rent any machine with a terminal and use the one line above.
+- **Vast.ai, RunPod** and the like: make a template with the image `ghcr.io/wasdharrison/jamtube-lyrics-worker:latest`, the environment variables `JAMTUBE_LYRICS_URL`, `WORKER_KEY` and `WORKER_NAME`, the launch mode that runs the image's own command (Vast.ai: Docker ENTRYPOINT), and 25 GB of disk (the image is about 10 GB). Pick a machine whose CUDA is 13.0 or newer (vocal removal runs on ONNX Runtime, built for CUDA 13: with an older driver it quietly uses the CPU); one RTX 3060 is plenty. A machine rented with it starts working as soon as it's up, and it's fine to destroy it any time: its song goes to another worker or back to the server. Or rent any machine with a terminal and use the one line above.
 - **GCP, AWS, Azure** (a VM with an NVIDIA GPU): use a GPU-ready image (it has the NVIDIA driver and Docker with GPU support), then:
 
 ```sh
