@@ -35,7 +35,7 @@ RETRY_SECONDS = [1, 2, 5, 10, 30]
 # How long an answer to "a job?" can take: the server holds it until there's one, up to its own
 # WORKER_POLL_SECONDS (25), so this is only for a server that stopped answering.
 POLL_TIMEOUT_SECONDS = 120
-# Downloading the song parts and sending back the instrumental (tens of MB on a slow connection).
+# Downloading the song's sound and sending back the instrumental (tens of MB on a slow connection).
 TRANSFER_TIMEOUT_SECONDS = 600
 CHUNK_BYTES = 1 << 20
 
@@ -202,13 +202,13 @@ class Hearing:
         self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
 
     def hear(self, job, source, instrumental, target):
-        """What's sung in the song parts (`source` less `instrumental`), where they are in its
-        music video (the job's `hear`), saved to `target` (.npy). False if it can't."""
+        """What's sung in the song (`source` less `instrumental`), if the job says to hear it,
+        saved to `target` (.npy). False if it doesn't, or can't."""
         if not job.get('hear') or not self.loaded:
             return False
         import numpy
         _, singing, ears = self.loaded
-        vocals, rate = singing.vocals_to_hear(source, instrumental, job['hear']['spans'], job['hear']['samples'])
+        vocals, rate = singing.vocals_to_hear(source, instrumental)
         numpy.save(target, ears.hear(vocals, rate).astype(numpy.float32))
         return True
 

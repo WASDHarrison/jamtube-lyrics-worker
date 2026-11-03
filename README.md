@@ -78,9 +78,9 @@ Plain HTTPS, always started by the worker. It works behind home routers, firewal
 - `GET /workers/models/:file`: those models (`HEAD` for their size, to tell when one's changed).
 - `GET /workers/singing.py`: the server's code for hearing the singing.
 - `POST /workers/jobs/next` `{ name }`: asks for a song. The server holds the request until it has one (up to `WORKER_POLL_SECONDS`), and answers `204` when it has none, so the worker asks again. A worker waiting here is free.
-- `GET /workers/jobs/:id/audio`: the song's parts to take the vocals out of (FLAC, lossless, 16-bit, 44.1 kHz).
+- `GET /workers/jobs/:id/audio`: the music video's sound to take the vocals out of (FLAC, lossless, 16-bit, 44.1 kHz).
 - `POST /workers/jobs/:id/heartbeat`: every `heartbeatSeconds` while on it. `410` means the server doesn't want it anymore (the song was dropped, or went elsewhere), so the worker drops it.
-- `POST /workers/jobs/:id/heard`: what's sung, frame by frame (a NumPy `.npy` file), when the job's `hear` says where the song parts are in the music video. Before the result. The server checks a stretch of it against its own hearing before using it.
+- `POST /workers/jobs/:id/heard`: what's sung, frame by frame (a NumPy `.npy` file), when the job's `hear` says to. Before the result. The server checks a stretch of it against its own hearing before using it.
 - `POST /workers/jobs/:id/result`: the instrumental (FLAC). That ends the job.
 - `POST /workers/jobs/:id/failed` `{ error }`: couldn't, so the song goes to another worker or back to the server.
 
