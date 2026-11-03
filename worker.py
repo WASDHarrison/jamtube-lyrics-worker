@@ -2,16 +2,19 @@
 """JamTube Lyrics worker: takes the vocals out of songs for a JamTube Lyrics server.
 
 It connects to the server (JAMTUBE_LYRICS_URL, with its WORKER_KEY), asks for a song, takes its
-vocals out the way the server would (same separator, model and settings), sends it back, and
+vocals out the way the server would (same separator, model and settings), hears what's sung in
+them (with the server's singing model and its own code for it, singing.py), sends both back, and
 asks for the next. Run as many as you like, anywhere: the server gives each song to a free one,
 and does it itself when none is free, or when one fails or goes quiet. Nothing is kept: each
 song is downloaded into this run's temporary folder and deleted once it's sent back, and the
-folder goes when the worker stops. Only the model is kept (MODELS_DIR), so it's downloaded once.
+folder goes when the worker stops. Only the models are kept (MODELS_DIR), so they're downloaded
+once, from the server.
 
     python worker.py --server https://lyrics.example.com --key <WORKER_KEY>
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import platform
@@ -96,7 +99,28 @@ class Server:
     def upload(self, path, source):
         with open(source, 'rb') as file:
             return self.request('POST', path, data=file, timeout=TRANSFER_TIMEOUT_SECONDS,
-                                headers={'Content-Type': 'audio/flac', 'Content-Length': str(os.path.getsize(source))})[0]
+                                headers={'Content-Type': 'application/octet-stream', 'Content-Length': str(os.path.getsize(source))})[0]
+
+    def model(self, name, folder):
+        """The server's model `name`, in `folder`: downloaded from it unless it's here already at
+        the same size (another size: the server's changed it). False if the server doesn't give
+        it out (vocal removal then downloads its own)."""
+        target = os.path.join(folder, name)
+        request = urllib.request.Request(f'{self.url}/workers/models/{name}', method='HEAD',
+                                         headers={'Authorization': f'Bearer {self.key}', 'User-Agent': 'jamtube-lyrics-worker'})
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                size = int(response.headers.get('Content-Length') or -1)
+        except urllib.error.HTTPError:
+            return False
+        if os.path.exists(target) and os.path.getsize(target) == size:
+            return True
+        os.makedirs(folder, exist_ok=True)
+        log(f'Downloading {name} from the server')
+        if self.download(f'/workers/models/{name}', f'{target}.download') != 200:
+            return False
+        os.replace(f'{target}.download', target)
+        return True
 
 
 class Separator:
@@ -110,8 +134,8 @@ class Separator:
         os.makedirs(out_dir, exist_ok=True)
 
     def load(self, how):
-        """The model `how` says ({ separator, model, overlap }), downloaded the first time and
-        loaded, if it isn't already. Demucs loads its own each time (see demucs)."""
+        """The model `how` says ({ separator, model, overlap }), loaded, if it isn't already (it's
+        downloaded first, see Server.model). Demucs loads its own each time (see demucs)."""
         if how['separator'] != 'mdx':
             return
         key = (how['separator'], how['model'], how['overlap'])
@@ -126,7 +150,7 @@ class Separator:
             mdx_params={'hop_length': 1024, 'segment_size': 256, 'overlap': how['overlap'], 'batch_size': 1,
                         'enable_denoise': False},
         )
-        log(f"Loading {how['model']} (downloaded into {self.models_dir} the first time)")
+        log(f"Loading {how['model']}")
         separator.load_model(model_filename=how['model'])
         self.loaded = (key, separator)
 
@@ -154,6 +178,41 @@ class Separator:
         return path
 
 
+class Hearing:
+    """Hears what's sung in a song's vocals the way the server does: its singing.py and its
+    singing model, both from the server (see /workers/setup there). Off when it has none."""
+
+    def __init__(self, models_dir, code_dir):
+        self.models_dir = models_dir
+        self.code_dir = code_dir
+        self.loaded = None  # (model name, singing module, its Ears)
+
+    def load(self, server, name):
+        """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already."""
+        if not name or (self.loaded and self.loaded[0] == name):
+            return
+        code = os.path.join(self.code_dir, 'singing.py')
+        if server.download('/workers/singing.py', code) != 200 or not server.model(name, self.models_dir):
+            log("The server doesn't hear the singing here: it does that itself.")
+            return
+        spec = importlib.util.spec_from_file_location('singing', code)
+        singing = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(singing)
+        log(f'Loading {name}')
+        self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
+
+    def hear(self, job, source, instrumental, target):
+        """What's sung in the song parts (`source` less `instrumental`), where they are in its
+        music video (the job's `hear`), saved to `target` (.npy). False if it can't."""
+        if not job.get('hear') or not self.loaded:
+            return False
+        import numpy
+        _, singing, ears = self.loaded
+        vocals, rate = singing.vocals_to_hear(source, instrumental, job['hear']['spans'], job['hear']['samples'])
+        numpy.save(target, ears.hear(vocals, rate).astype(numpy.float32))
+        return True
+
+
 def keep_saying(server, job, stop, dropped):
     """While a job's being done: tells the server every heartbeatSeconds, and notes when it's
     said it doesn't want it anymore."""
@@ -166,9 +225,9 @@ def keep_saying(server, job, stop, dropped):
             pass  # a moment's trouble reaching it: the next one may get through
 
 
-def work(server, separator, job, folder):
-    """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out,
-    and the instrumental sent back."""
+def work(server, separator, hearing, job, folder):
+    """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
+    and heard, and both sent back: what was heard first, then the instrumental, which ends it."""
     started = time.time()
     stop, dropped = threading.Event(), threading.Event()
     threading.Thread(target=keep_saying, args=(server, job, stop, dropped), daemon=True).start()
@@ -180,6 +239,13 @@ def work(server, separator, job, folder):
             return
         log(f"Removing the vocals ({job['separator']}, {job['model']})")
         result = separator.instrumental(job, source)
+        heard = os.path.join(folder, 'heard.npy')
+        try:
+            if hearing.hear(job, source, result, heard) and not dropped.is_set():
+                log('Heard the singing')
+                server.upload(f"/workers/jobs/{job['id']}/heard", heard)
+        except Exception as error:  # the server hears it itself
+            log(f"Couldn't hear the singing ({str(error)[:300]}): the server will.")
         if dropped.is_set():
             log("Done, but it's not wanted anymore.")
             return
@@ -240,20 +306,25 @@ def main():
     # stops (a worker killed outright leaves it to the system, which clears its temporary files).
     scratch = tempfile.mkdtemp(prefix='jamtube-worker-')
     separator = Separator(args.models_dir, os.path.join(scratch, 'out'))
+    hearing = Hearing(args.models_dir, scratch)
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
     failures = 0
-    ready = False  # the server's model loaded (see Separator.load), before its first song
+    ready = False  # the server's models loaded (see Separator.load and Hearing.load), before its first song
     try:
         while True:
             try:
                 if not ready:
-                    status, body = server.request('GET', '/workers/separator')
+                    status, body = server.request('GET', '/workers/setup')
                     if status == 200:
+                        setup = json.loads(body)
                         try:
-                            separator.load(json.loads(body))
+                            if setup['separator'] == 'mdx':
+                                server.model(setup['model'], args.models_dir)
+                            separator.load(setup)
+                            hearing.load(server, setup.get('singing'))
                             log('Ready for songs.')
                         except Exception as error:  # the first song tries again
-                            log(f"Couldn't get the model ready ({str(error)[:300]}): the first song will try again.")
+                            log(f"Couldn't get the models ready ({str(error)[:300]}): the first song will try again.")
                     ready = status < 500  # an older server (404) doesn't say: the first song loads it
                 status, body = server.request('POST', '/workers/jobs/next', body=me, timeout=POLL_TIMEOUT_SECONDS)
             except OSError as error:
@@ -272,7 +343,7 @@ def main():
                 sys.exit("The server has no workers (WORKER_KEY isn't set there), or that isn't its address.")
             if status == 200:
                 job = json.loads(body)
-                work(server, separator, job, os.path.join(scratch, 'song'))
+                work(server, separator, hearing, job, os.path.join(scratch, 'song'))
             elif status != 204:
                 time.sleep(RETRY_SECONDS[-1 if status >= 500 else 0])
     except KeyboardInterrupt:
