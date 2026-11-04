@@ -4,7 +4,8 @@
 It connects to the server (JAMTUBE_LYRICS_URL, with its WORKER_KEY), asks for a song, takes its
 vocals out the way the server would (same separator, model and settings), hears what's sung in
 them (with the server's singing model and its own code for it, singing.py), sends both back, and
-asks for the next. Run as many as you like, anywhere: the server gives each song to a free one,
+asks for the next: as many songs at once as the server says (its WORKER_JOBS), each in a slot
+of its own, so while one has its vocals taken out, the next downloads and the last is sent back. Run as many as you like, anywhere: the server gives each song to a free one,
 and does it itself when none is free, or when one fails or goes quiet. Nothing is kept: each
 song is downloaded into this run's temporary folder and deleted once it's sent back, and the
 folder goes when the worker stops. Only the models are kept (MODELS_DIR), so they're downloaded
@@ -187,6 +188,7 @@ class Hearing:
         self.models_dir = models_dir
         self.code_dir = code_dir
         self.loaded = None  # (model name, singing module, its Ears)
+        self.lock = threading.Lock()  # shared by the slots: one hears at a time
 
     def load(self, server, name):
         """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already."""
@@ -210,7 +212,9 @@ class Hearing:
         import numpy
         _, singing, ears = self.loaded
         vocals, rate = singing.vocals_to_hear(source, instrumental)
-        numpy.save(target, ears.hear(vocals, rate).astype(numpy.float32))
+        with self.lock:
+            heard = ears.hear(vocals, rate)
+        numpy.save(target, heard.astype(numpy.float32))
         return True
 
 
@@ -226,9 +230,10 @@ def keep_saying(server, job, stop, dropped):
             pass  # a moment's trouble reaching it: the next one may get through
 
 
-def work(server, separator, hearing, job, folder):
+def work(server, separator, hearing, job, folder, say):
     """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
-    and heard, and both sent back: what was heard first, then the instrumental, which ends it."""
+    and heard, and both sent back: what was heard first, then the instrumental, which ends it.
+    `say` logs, saying which slot."""
     started = time.time()
     stop, dropped = threading.Event(), threading.Event()
     threading.Thread(target=keep_saying, args=(server, job, stop, dropped), daemon=True).start()
@@ -236,35 +241,70 @@ def work(server, separator, hearing, job, folder):
     try:
         source = os.path.join(folder, 'song-parts.flac')
         if server.download(f"/workers/jobs/{job['id']}/audio", source) != 200:
-            log('The song was taken back before it was downloaded.')
+            say('The song was taken back before it was downloaded.')
             return
-        log(f"Removing the vocals ({job['separator']}, {job['model']})")
+        say(f"Removing the vocals ({job['separator']}, {job['model']})")
         result = separator.instrumental(job, source)
         heard = os.path.join(folder, 'heard.npy')
         try:
             if hearing.hear(job, source, result, heard) and not dropped.is_set():
-                log('Heard the singing')
+                say('Heard the singing')
                 server.upload(f"/workers/jobs/{job['id']}/heard", heard)
         except Exception as error:  # the server hears it itself
-            log(f"Couldn't hear the singing ({str(error)[:300]}): the server will.")
+            say(f"Couldn't hear the singing ({str(error)[:300]}): the server will.")
         if dropped.is_set():
-            log("Done, but it's not wanted anymore.")
+            say("Done, but it's not wanted anymore.")
             return
         status = server.upload(f"/workers/jobs/{job['id']}/result", result)
-        log(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
-    except (Exception, KeyboardInterrupt) as error:  # anything at all, or stopped: the server gives the song to someone else
-        reason = 'the worker was stopped' if isinstance(error, KeyboardInterrupt) else str(error)[:300]
-        log(f"Couldn't: {reason}")
-        try:
-            server.request('POST', f"/workers/jobs/{job['id']}/failed", body={'error': reason}, timeout=30)
-        except OSError:
-            pass  # it'll notice the silence instead
-        if isinstance(error, KeyboardInterrupt):
-            raise
+        say(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
+    except Exception as error:  # anything at all: the server gives the song to someone else
+        say(f"Couldn't: {str(error)[:300]}")
+        give_back(server, job, str(error)[:300])
     finally:
         stop.set()
         shutil.rmtree(folder, ignore_errors=True)
         empty(separator.out_dir)
+
+
+def give_back(server, job, reason):
+    """Tells the server this worker won't finish `job`, so it goes elsewhere straight away."""
+    try:
+        server.request('POST', f"/workers/jobs/{job['id']}/failed", body={'error': reason}, timeout=30)
+    except OSError:
+        pass  # it'll notice the silence instead
+
+
+def take_songs(server, separator, hearing, folder, me, doing, say, quit):
+    """One slot: asks for a song, does it (see work), and asks for the next, again and again.
+    `doing` is the jobs the slots are doing (so they can be given back if the worker's stopped),
+    and `quit(why)` stops the worker when the server won't have it."""
+    failures = 0
+    while True:
+        try:
+            status, body = server.request('POST', '/workers/jobs/next', body=me, timeout=POLL_TIMEOUT_SECONDS)
+        except OSError as error:
+            wait = RETRY_SECONDS[min(failures, len(RETRY_SECONDS) - 1)]
+            if failures == 0:
+                say(f"Can't reach the server ({error}): trying again until it can be.")
+            failures += 1
+            time.sleep(wait)
+            continue
+        if failures:
+            say('Connected again.')
+            failures = 0
+        if status == 401:
+            return quit('The server refused the key: it has to be its WORKER_KEY.')
+        if status == 404:
+            return quit("The server has no workers (WORKER_KEY isn't set there), or that isn't its address.")
+        if status == 200:
+            job = json.loads(body)
+            doing[job['id']] = job
+            try:
+                work(server, separator, hearing, job, folder, say)
+            finally:
+                doing.pop(job['id'], None)
+        elif status != 204:
+            time.sleep(RETRY_SECONDS[-1 if status >= 500 else 0])
 
 
 def accelerator():
@@ -303,52 +343,62 @@ def main():
     use_ffmpeg()
     server = Server(args.server, args.key)
     me = {'id': str(uuid.uuid4()), 'name': args.name}  # its own id, so several can share a name
-    # This run's one temporary folder: each song, and its vocal removal's output. Gone when it
-    # stops (a worker killed outright leaves it to the system, which clears its temporary files).
+    # This run's one temporary folder: each slot's song, and its vocal removal's output. Gone when
+    # it stops (a worker killed outright leaves it to the system, which clears its temporary files).
     scratch = tempfile.mkdtemp(prefix='jamtube-worker-')
-    separator = Separator(args.models_dir, os.path.join(scratch, 'out'))
     hearing = Hearing(args.models_dir, scratch)
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
-    failures = 0
-    ready = False  # the server's models loaded (see Separator.load and Hearing.load), before its first song
+    doing = {}  # job id -> job: the songs the slots are doing
+    stop = threading.Event()
+    stopped_why = []
     try:
+        # How the server removes vocals and hears them, and how many songs to take at once: asked
+        # until it answers (an older server doesn't say: one at a time, each loading its model).
+        failures = 0
         while True:
             try:
-                if not ready:
-                    status, body = server.request('GET', '/workers/setup')
-                    if status == 200:
-                        setup = json.loads(body)
-                        try:
-                            if setup['separator'] == 'mdx':
-                                server.model(setup['model'], args.models_dir)
-                            separator.load(setup)
-                            hearing.load(server, setup.get('singing'))
-                            log('Ready for songs.')
-                        except Exception as error:  # the first song tries again
-                            log(f"Couldn't get the models ready ({str(error)[:300]}): the first song will try again.")
-                    ready = status < 500  # an older server (404) doesn't say: the first song loads it
-                status, body = server.request('POST', '/workers/jobs/next', body=me, timeout=POLL_TIMEOUT_SECONDS)
+                status, body = server.request('GET', '/workers/setup')
+                if status < 500:
+                    break
+                problem = f'it answered {status}'
             except OSError as error:
-                wait = RETRY_SECONDS[min(failures, len(RETRY_SECONDS) - 1)]
-                if failures == 0:
-                    log(f"Can't reach the server ({error}): trying again until it can be.")
-                failures += 1
-                time.sleep(wait)
-                continue
-            if failures:
-                log('Connected again.')
-                failures = 0
-            if status == 401:
-                sys.exit('The server refused the key: it has to be its WORKER_KEY.')
-            if status == 404:
-                sys.exit("The server has no workers (WORKER_KEY isn't set there), or that isn't its address.")
-            if status == 200:
-                job = json.loads(body)
-                work(server, separator, hearing, job, os.path.join(scratch, 'song'))
-            elif status != 204:
-                time.sleep(RETRY_SECONDS[-1 if status >= 500 else 0])
+                problem = str(error)
+            if failures == 0:
+                log(f"Can't reach the server ({problem}): trying again until it can be.")
+            time.sleep(RETRY_SECONDS[min(failures, len(RETRY_SECONDS) - 1)])
+            failures += 1
+        setup = json.loads(body) if status == 200 else {}
+        slots = max(1, int(setup.get('jobs') or 1))
+        separators = [Separator(args.models_dir, os.path.join(scratch, f'out-{slot}')) for slot in range(slots)]
+        if setup:
+            try:
+                if setup['separator'] == 'mdx':
+                    server.model(setup['model'], args.models_dir)
+                for separator in separators:
+                    separator.load(setup)
+                hearing.load(server, setup.get('singing'))
+                log(f"Ready for songs{f', {slots} at once' if slots > 1 else ''}.")
+            except Exception as error:  # the first song tries again
+                log(f"Couldn't get the models ready ({str(error)[:300]}): the first song will try again.")
+
+        def quit(why):
+            stopped_why.append(why)
+            stop.set()
+        for slot, separator in enumerate(separators, 1):
+            def say(message, slot=slot):
+                log(f'[{slot}] {message}' if slots > 1 else message)
+            threading.Thread(target=take_songs, daemon=True,
+                             args=(server, separator, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit)).start()
+        while not stop.wait(1):
+            pass
+        sys.exit(stopped_why[0])
     except KeyboardInterrupt:
-        log('Stopped.')
+        # Stopped (Ctrl+C, docker stop, a cloud taking back its machine): the server's told about
+        # each song it was doing, so they go elsewhere straight away.
+        songs = list(doing.values())
+        for job in songs:
+            give_back(server, job, 'the worker was stopped')
+        log(f"Stopped: {'its song goes' if len(songs) == 1 else f'its {len(songs)} songs go'} back to the server." if songs else 'Stopped.')
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
