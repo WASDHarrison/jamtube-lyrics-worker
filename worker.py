@@ -34,6 +34,12 @@ import urllib.error
 import urllib.request
 import uuid
 
+# Vocal removal's progress bars redraw themselves in place, which only works in a live terminal:
+# in a saved log (a cloud's log viewer, docker logs) each redraw is lines of blank space. So
+# they're only shown in a terminal; its own lines (and the separator's) are logged either way.
+if not sys.stderr.isatty():
+    os.environ.setdefault('TQDM_DISABLE', '1')
+
 # Waits before trying the server again while it can't be reached (then the last, again and
 # again): soon enough to be back within seconds of a restart, when its songs are waiting.
 RETRY_SECONDS = [1, 2, 3, 5]
