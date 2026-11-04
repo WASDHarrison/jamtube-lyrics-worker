@@ -5,8 +5,10 @@ It connects to the server (JAMTUBE_LYRICS_URL, with its WORKER_KEY), asks for a 
 vocals out the way the server would (same separator, model and settings), hears what's sung in
 them (with the server's singing model and its own code for it, singing.py), sends both back, and
 asks for the next: as many songs at once as the server says (its MAX_WORKER_JOBS), each in a slot
-of its own, so while one has its vocals taken out, the next downloads and the last is sent back. Run as many as you like, anywhere: the server gives each song to a free one,
-and does it itself when none is free, or when one fails or goes quiet. Nothing is kept: each
+of its own, so while one has its vocals taken out, the next downloads and the last is sent back
+(on an NVIDIA GPU, only as many remove vocals at once as its memory fits: GPU_MEMORY_PER_SONG_MB).
+Run as many as you like, anywhere: the server gives each song to a free one, and does it itself
+when none is free, or when one fails or goes quiet. Nothing is kept: each
 song is downloaded into this run's temporary folder and deleted once it's sent back, and the
 folder goes when the worker stops. Only the models are kept (MODELS_DIR), so they're downloaded
 once, from the server.
@@ -19,6 +21,7 @@ import importlib.util
 import json
 import os
 import platform
+import queue
 import shutil
 import signal
 import socket
@@ -230,10 +233,11 @@ def keep_saying(server, job, stop, dropped):
             pass  # a moment's trouble reaching it: the next one may get through
 
 
-def work(server, separator, hearing, job, folder, say):
+def work(server, separators, hearing, job, folder, say):
     """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
     and heard, and both sent back: what was heard first, then the instrumental, which ends it.
-    `say` logs, saying which slot."""
+    Its vocals are taken out by one of `separators` (a queue shared by the slots: as many as the
+    GPU's memory fits), waiting for one to be free. `say` logs, saying which slot."""
     started = time.time()
     stop, dropped = threading.Event(), threading.Event()
     threading.Thread(target=keep_saying, args=(server, job, stop, dropped), daemon=True).start()
@@ -243,8 +247,14 @@ def work(server, separator, hearing, job, folder, say):
         if server.download(f"/workers/jobs/{job['id']}/audio", source) != 200:
             say('The song was taken back before it was downloaded.')
             return
-        say(f"Removing the vocals ({job['separator']}, {job['model']})")
-        result = separator.instrumental(job, source)
+        separator = separators.get()
+        try:
+            say(f"Removing the vocals ({job['separator']}, {job['model']})")
+            result = os.path.join(folder, 'instrumental.flac')
+            shutil.move(separator.instrumental(job, source), result)
+        finally:
+            empty(separator.out_dir)
+            separators.put(separator)
         heard = os.path.join(folder, 'heard.npy')
         try:
             if hearing.hear(job, source, result, heard) and not dropped.is_set():
@@ -263,7 +273,6 @@ def work(server, separator, hearing, job, folder, say):
     finally:
         stop.set()
         shutil.rmtree(folder, ignore_errors=True)
-        empty(separator.out_dir)
 
 
 def give_back(server, job, reason):
@@ -274,7 +283,7 @@ def give_back(server, job, reason):
         pass  # it'll notice the silence instead
 
 
-def take_songs(server, separator, hearing, folder, me, doing, say, quit):
+def take_songs(server, separators, hearing, folder, me, doing, say, quit):
     """One slot: asks for a song, does it (see work), and asks for the next, again and again.
     `doing` is the jobs the slots are doing (so they can be given back if the worker's stopped),
     and `quit(why)` stops the worker when the server won't have it."""
@@ -300,7 +309,7 @@ def take_songs(server, separator, hearing, folder, me, doing, say, quit):
             job = json.loads(body)
             doing[job['id']] = job
             try:
-                work(server, separator, hearing, job, folder, say)
+                work(server, separators, hearing, job, folder, say)
             finally:
                 doing.pop(job['id'], None)
         elif status != 204:
@@ -323,6 +332,24 @@ def accelerator():
     return 'the CPU'
 
 
+def gpu_memory_mb():
+    """The NVIDIA GPU's memory in MB, or None without one."""
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch.cuda.get_device_properties(0).total_memory / 2**20 if torch.cuda.is_available() else None
+
+
+def fitting(slots, per_song_mb):
+    """How many songs can have their vocals removed at once: one for each slot, but on an NVIDIA
+    GPU, only as many as its memory fits (each loads the model, and works in GPU memory)."""
+    total_mb = gpu_memory_mb()
+    if total_mb is None or per_song_mb <= 0:
+        return slots
+    return max(1, min(slots, int(total_mb // per_song_mb)))
+
+
 def main():
     parser = argparse.ArgumentParser(description='Takes the vocals out of songs for a JamTube Lyrics server.')
     parser.add_argument('--server', default=os.environ.get('JAMTUBE_LYRICS_URL', ''), help="The server's address (or JAMTUBE_LYRICS_URL).")
@@ -330,6 +357,8 @@ def main():
     parser.add_argument('--name', default=os.environ.get('WORKER_NAME') or socket.gethostname(), help="What the server calls it (or WORKER_NAME; this computer's name).")
     parser.add_argument('--models-dir', default=os.environ.get('MODELS_DIR') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models'),
                         help="Where the model is kept between runs (or MODELS_DIR; models, next to this).")
+    parser.add_argument('--gpu-memory-per-song', type=int, default=int(os.environ.get('GPU_MEMORY_PER_SONG_MB') or 2500),
+                        help="GPU memory one song's vocal removal takes, in MB (or GPU_MEMORY_PER_SONG_MB; 2500): on an NVIDIA GPU, only as many songs as fit have their vocals removed at once. 0: one for each slot.")
     args = parser.parse_args()
     if not args.server or not args.key:
         parser.error('Say which server and its WORKER_KEY: --server and --key (or JAMTUBE_LYRICS_URL and WORKER_KEY).')
@@ -369,26 +398,32 @@ def main():
             failures += 1
         setup = json.loads(body) if status == 200 else {}
         slots = max(1, int(setup.get('jobs') or 1))
-        separators = [Separator(args.models_dir, os.path.join(scratch, f'out-{slot}')) for slot in range(slots)]
+        # The slots download and send back songs side by side, sharing the separators: as many as
+        # the GPU's memory fits (each holds its model and works in GPU memory).
+        removing = fitting(slots, args.gpu_memory_per_song)
+        separators = queue.Queue()
+        for number in range(removing):
+            separators.put(Separator(args.models_dir, os.path.join(scratch, f'out-{number}')))
         if setup:
             try:
                 if setup['separator'] == 'mdx':
                     server.model(setup['model'], args.models_dir)
-                for separator in separators:
+                for separator in list(separators.queue):
                     separator.load(setup)
                 hearing.load(server, setup.get('singing'))
-                log(f"Ready for songs{f', {slots} at once' if slots > 1 else ''}.")
+                fits = f', removing the vocals of {removing} at once (what the GPU\'s memory fits)' if removing < slots else ''
+                log(f"Ready for songs{f', {slots} at once' if slots > 1 else ''}{fits}.")
             except Exception as error:  # the first song tries again
                 log(f"Couldn't get the models ready ({str(error)[:300]}): the first song will try again.")
 
         def quit(why):
             stopped_why.append(why)
             stop.set()
-        for slot, separator in enumerate(separators, 1):
+        for slot in range(1, slots + 1):
             def say(message, slot=slot):
                 log(f'[{slot}] {message}' if slots > 1 else message)
             threading.Thread(target=take_songs, daemon=True,
-                             args=(server, separator, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit)).start()
+                             args=(server, separators, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit)).start()
         while not stop.wait(1):
             pass
         sys.exit(stopped_why[0])

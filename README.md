@@ -59,6 +59,7 @@ docker run -d --restart unless-stopped --gpus all \
 | `--key` | `WORKER_KEY` | | The server's `WORKER_KEY`. |
 | `--name` | `WORKER_NAME` | the computer's name | What the server calls it. |
 | `--models-dir` | `MODELS_DIR` | `models`, in its folder | Where the models are kept between runs. |
+| `--gpu-memory-per-song` | `GPU_MEMORY_PER_SONG_MB` | `2500` | GPU memory one song's vocal removal takes, in MB. On an NVIDIA GPU, the slots (the server's `MAX_WORKER_JOBS`) download and send back songs side by side, but only as many as the GPU's memory fits remove vocals at once (4 on a 12 GB RTX 3060): the others wait their turn, instead of running out of GPU memory. `0`: one for each slot. |
 
 And for the start script (`run.sh`, `run.ps1`):
 
