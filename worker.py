@@ -4,7 +4,7 @@
 It connects to the server (JAMTUBE_LYRICS_URL, with its WORKER_KEY), asks for a song, takes its
 vocals out the way the server would (same separator, model and settings), hears what's sung in
 them (with the server's singing model and its own code for it, singing.py), sends both back, and
-asks for the next: as many songs at once as the server says (its WORKER_JOBS), each in a slot
+asks for the next: as many songs at once as the server says (its MAX_WORKER_JOBS), each in a slot
 of its own, so while one has its vocals taken out, the next downloads and the last is sent back. Run as many as you like, anywhere: the server gives each song to a free one,
 and does it itself when none is free, or when one fails or goes quiet. Nothing is kept: each
 song is downloaded into this run's temporary folder and deleted once it's sent back, and the

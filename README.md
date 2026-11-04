@@ -74,7 +74,7 @@ How often a worker checks in, and how long one can go quiet before its song goes
 
 Plain HTTPS, always started by the worker. It works behind home routers, firewalls and cloud networks with nothing opened on the worker's side.
 
-- `GET /workers/setup`: how the server removes vocals and the singing model it hears them with (`{ separator, model, overlap, singing, jobs }`; `singing` is null when it has none), so the worker can get them ready when it starts, and how many songs to take at once (`jobs`, the server's `WORKER_JOBS`): the worker runs that many slots, each asking for songs on its own, so while one has its vocals taken out, the next downloads and the last is sent back.
+- `GET /workers/setup`: how the server removes vocals and the singing model it hears them with (`{ separator, model, overlap, singing, jobs }`; `singing` is null when it has none), so the worker can get them ready when it starts, and how many songs to take at once (`jobs`, the server's `MAX_WORKER_JOBS`): the worker runs that many slots, each asking for songs on its own, so while one has its vocals taken out, the next downloads and the last is sent back.
 - `GET /workers/models/:file`: those models (`HEAD` for their size, to tell when one's changed).
 - `GET /workers/singing.py`: the server's code for hearing the singing.
 - `POST /workers/jobs/next` `{ name }`: asks for a song. The server holds the request until it has one (up to `WORKER_POLL_SECONDS`), and answers `204` when it has none, so the worker asks again. A worker waiting here is free.
