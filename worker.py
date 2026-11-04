@@ -17,6 +17,7 @@ once, from the server.
 import argparse
 import importlib.util
 import json
+import logging
 import os
 import platform
 import shutil
@@ -30,6 +31,9 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+
+# The worker's log is its own lines: vocal removal's progress bars (tqdm) are left out.
+os.environ.setdefault('TQDM_DISABLE', '1')
 
 # Waits before trying the server again while it can't be reached (then the last, again and
 # again): soon enough to be back within seconds of a restart, when its songs are waiting.
@@ -149,6 +153,7 @@ class Separator:
             model_file_dir=self.models_dir,
             output_format='FLAC',
             output_single_stem='Instrumental',
+            log_level=logging.WARNING,  # only its problems: what it's doing is said here
             mdx_params={'hop_length': 1024, 'segment_size': 256, 'overlap': how['overlap'], 'batch_size': 1,
                         'enable_denoise': False},
         )
