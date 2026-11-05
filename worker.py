@@ -239,9 +239,22 @@ class Hearing:
         vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
             heard = ears.hear(vocals, rate)
+        singing.save_heard(target, heard)
+        return True
+
+    def hear_more(self, job, source, instrumental, target):
+        """What MMS and Whisper hear sung in the song, if the job asks (`others`), saved to
+        `target` (see save_others in singing.py). False if it doesn't, or can't."""
+        if not job.get('hear') or not self.loaded or not any((job.get('others') or {}).values()):
+            return False
+        _, singing, _ = self.loaded
+        vocals, rate = singing.vocals_to_hear(source, instrumental)
+        with self.lock:
             others = self.other_ears(singing, job.get('others'))
-            more = others.hear(vocals, rate) if others else None
-        singing.save_heard(target, heard, more)
+            if not others:
+                return False
+            more = others.hear(vocals, rate)
+        singing.save_others(target, more)
         return True
 
 
@@ -260,6 +273,8 @@ def keep_saying(server, job, stop, dropped):
 def work(server, separators, hearing, job, folder, say):
     """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
     and heard, and both sent back: what was heard first, then the instrumental, which ends it.
+    Then, if it asks, it's heard by MMS and Whisper too, sent after it (the song only waits for
+    that if the singing model wasn't sure of its lyrics).
     Its vocals are taken out by one of `separators` (a queue shared by the slots: as many as the
     GPU's memory fits), waiting for one to be free. `say` logs, saying which slot."""
     started = time.time()
@@ -291,6 +306,13 @@ def work(server, separators, hearing, job, folder, say):
             return
         status = server.upload(f"/workers/jobs/{job['id']}/result", result)
         say(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
+        others = os.path.join(folder, 'others.npz')
+        try:
+            if status == 204 and hearing.hear_more(job, source, result, others):
+                status = server.upload(f"/workers/jobs/{job['id']}/others", others)
+                say('Sent what MMS and Whisper heard.' if status == 204 else "Heard with MMS and Whisper, but it's not waited for anymore.")
+        except Exception as error:  # the song does without
+            say(f"Couldn't hear it with MMS and Whisper ({str(error)[:300]}).")
     except Exception as error:  # anything at all: the server gives the song to someone else
         say(f"Couldn't: {str(error)[:300]}")
         give_back(server, job, str(error)[:300])
