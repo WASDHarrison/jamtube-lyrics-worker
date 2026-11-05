@@ -17,7 +17,6 @@ once, from the server.
 """
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -197,35 +196,30 @@ class Hearing:
     def __init__(self, models_dir, code_dir):
         self.models_dir = models_dir
         self.code_dir = code_dir
-        self.loaded = None  # (model name, singing module, its Ears, its code's SHA-1)
+        self.loaded = None  # (model name, singing module, its Ears)
         self.lock = threading.Lock()  # shared by the slots: one hears at a time
 
-    def load(self, server, name, code_sha=None):
-        """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already,
-        or its singing.py isn't `code_sha` (the server's changed: see its singingCode)."""
-        if not name or (self.loaded and self.loaded[0] == name and (not code_sha or self.loaded[3].startswith(code_sha))):
+    def load(self, server, name):
+        """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already."""
+        if not name or (self.loaded and self.loaded[0] == name):
             return
         code = os.path.join(self.code_dir, 'singing.py')
         if server.download('/workers/singing.py', code) != 200 or not server.model(name, self.models_dir):
             log("The server doesn't hear the singing here: it does that itself.")
             return
-        with open(code, 'rb') as file:
-            sha = hashlib.sha1(file.read()).hexdigest()
         spec = importlib.util.spec_from_file_location('singing', code)
         singing = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(singing)
-        log(f'Loading {name}' + (' (the server has a new way of hearing it)' if self.loaded else ''))
-        self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)), sha)
+        log(f'Loading {name}')
+        self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
 
-    def hear(self, server, job, source, instrumental, target):
+    def hear(self, job, source, instrumental, target):
         """What's sung in the song (`source` less `instrumental`), if the job says to hear it,
         saved to `target` (.npy). False if it doesn't, or can't."""
         if not job.get('hear') or not self.loaded:
             return False
         import numpy
-        with self.lock:
-            self.load(server, self.loaded[0], job.get('singingCode'))
-        _, singing, ears, _ = self.loaded
+        _, singing, ears = self.loaded
         vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
             heard = ears.hear(vocals, rate)
@@ -269,7 +263,7 @@ def work(server, separators, hearing, job, folder, say):
             separators.put(separator)
         heard = os.path.join(folder, 'heard.npy')
         try:
-            if hearing.hear(server, job, source, result, heard) and not dropped.is_set():
+            if hearing.hear(job, source, result, heard) and not dropped.is_set():
                 say('Heard the singing')
                 server.upload(f"/workers/jobs/{job['id']}/heard", heard)
         except Exception as error:  # the server hears it itself
@@ -295,10 +289,11 @@ def give_back(server, job, reason):
         pass  # it'll notice the silence instead
 
 
-def take_songs(server, separators, hearing, folder, me, doing, say, quit):
+def take_songs(server, separators, hearing, folder, me, doing, say, quit, outdated):
     """One slot: asks for a song, does it (see work), and asks for the next, again and again.
     `doing` is the jobs the slots are doing (so they can be given back if the worker's stopped),
-    and `quit(why)` stops the worker when the server won't have it."""
+    `quit(why)` stops the worker when the server won't have it, and `outdated()` says the server
+    was updated (this slot then stops: see update)."""
     failures = 0
     while True:
         try:
@@ -317,6 +312,8 @@ def take_songs(server, separators, hearing, folder, me, doing, say, quit):
             return quit('The server refused the key: it has to be its WORKER_KEY.')
         if status == 404:
             return quit("The server has no workers (WORKER_KEY isn't set there), or that isn't its address.")
+        if status == 409:
+            return outdated()
         if status == 200:
             job = json.loads(body)
             doing[job['id']] = job
@@ -326,6 +323,44 @@ def take_songs(server, separators, hearing, folder, me, doing, say, quit):
                 doing.pop(job['id'], None)
         elif status != 204:
             time.sleep(RETRY_SECONDS[-1 if status >= 500 else 0])
+
+
+def same_file(a, b):
+    try:
+        with open(a, 'rb') as first, open(b, 'rb') as second:
+            return first.read() == second.read()
+    except OSError:
+        return False
+
+
+def update(server, scratch):
+    """Starts again with the server's update (its songs are all done): its files (worker.py, and
+    what it needs installed, when they changed: not in a git checkout, which is updated with git),
+    then this worker again as it was started, which gets the rest (models, singing.py, setup)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    kind = 'gpu' if shutil.which('nvidia-smi') else 'cpu'
+    if os.path.isdir(os.path.join(here, '.git')):
+        log('This is a git checkout: its own files are updated with git pull.')
+    else:
+        got = {}
+        for name in ('worker.py', f'requirements-{kind}.txt'):
+            if server.download(f'/workers/files/{name}', os.path.join(scratch, name)) == 200:
+                got[name] = os.path.join(scratch, name)
+        requirements, mine = got.get(f'requirements-{kind}.txt'), os.path.join(here, f'requirements-{kind}.txt')
+        if requirements and not same_file(requirements, mine):
+            log(f'Installing what the update needs ({kind})')
+            uv = os.path.join(here, '.uv', 'bin', 'uv.exe' if os.name == 'nt' else 'uv')  # run.sh's and run.ps1's
+            command = ([uv, 'pip', 'install', '--python', sys.executable, '--index-strategy', 'unsafe-best-match'] if os.path.exists(uv)
+                       else [sys.executable, '-m', 'pip', 'install', '--no-cache-dir'])
+            subprocess.run([*command, '-r', requirements], check=True)
+            shutil.copy(requirements, mine)
+            if os.path.isdir(os.path.join(here, '.venv')):
+                shutil.copy(requirements, os.path.join(here, '.venv', 'installed'))  # so run.sh doesn't again
+        if 'worker.py' in got and not same_file(got['worker.py'], os.path.abspath(__file__)):
+            os.replace(got['worker.py'], os.path.abspath(__file__))
+    log('Starting again with the update.')
+    shutil.rmtree(scratch, ignore_errors=True)
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
 
 def accelerator():
@@ -409,6 +444,7 @@ def main():
             time.sleep(RETRY_SECONDS[min(failures, len(RETRY_SECONDS) - 1)])
             failures += 1
         setup = json.loads(body) if status == 200 else {}
+        me['version'] = setup.get('version')  # what the server's workers run (see update)
         slots = max(1, int(setup.get('jobs') or 1))
         # The slots download and send back songs side by side, sharing the separators: as many as
         # the GPU's memory fits (each holds its model and works in GPU memory).
@@ -431,13 +467,23 @@ def main():
         def quit(why):
             stopped_why.append(why)
             stop.set()
+        updated = threading.Event()
+
+        def outdated():
+            if not updated.is_set():
+                updated.set()
+                log('The server was updated: starting again with the update once the songs it has are done.' if doing
+                    else 'The server was updated: starting again with the update.')
+        threads = []
         for slot in range(1, slots + 1):
             def say(message, slot=slot):
                 log(f'[{slot}] {message}' if slots > 1 else message)
-            threading.Thread(target=take_songs, daemon=True,
-                             args=(server, separators, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit)).start()
+            threads.append(threading.Thread(target=take_songs, daemon=True,
+                                            args=(server, separators, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit, outdated)))
+            threads[-1].start()
         while not stop.wait(1):
-            pass
+            if updated.is_set() and not any(thread.is_alive() for thread in threads):
+                update(server, scratch)
         sys.exit(stopped_why[0])
     except KeyboardInterrupt:
         # Stopped (Ctrl+C, docker stop, a cloud taking back its machine): the server's told about

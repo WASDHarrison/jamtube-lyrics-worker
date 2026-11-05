@@ -12,6 +12,8 @@ Set `WORKER_KEY` in JamTube Lyrics' `.env` to a long random secret (`openssl ran
 
 Workers start from the server, which hands out this worker: keep a copy of this repository next to JamTube Lyrics' folder (`git clone` it beside it, and `git pull` it when you update the server), or say where it is with `WORKER_FILES_DIR`.
 
+Workers keep themselves up to date: when the server's updated (this worker, how it hears the singing, or its settings for workers, such as `MAX_WORKER_JOBS`), a running worker finishes the songs it has, gets the update from the server (installing anything new it needs), and starts again by itself, saying so in its log. Nothing has to be restarted by hand. A worker run from a git checkout of this repository restarts too, but its own files are yours to `git pull`.
+
 `GET /health` on the server lists the workers connected right now (`workers`).
 
 ## Starting a worker
