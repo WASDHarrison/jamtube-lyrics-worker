@@ -191,12 +191,14 @@ class Separator:
 
 class Hearing:
     """Hears what's sung in a song's vocals the way the server does: its singing.py and its
-    singing model, both from the server (see /workers/setup there). Off when it has none."""
+    singing model, both from the server (see /workers/setup there), and MMS and Whisper when a
+    job asks for them (see OtherEars in singing.py). Off when it has none."""
 
     def __init__(self, models_dir, code_dir):
         self.models_dir = models_dir
         self.code_dir = code_dir
         self.loaded = None  # (model name, singing module, its Ears)
+        self.others = None  # ({'mms': ..., 'whisper': ...}, their OtherEars, or None if they can't be)
         self.lock = threading.Lock()  # shared by the slots: one hears at a time
 
     def load(self, server, name):
@@ -213,17 +215,33 @@ class Hearing:
         log(f'Loading {name}')
         self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
 
+    def other_ears(self, singing, wanted):
+        """MMS and Whisper as the job wants them (`wanted`: their models), loaded the first time
+        (downloaded the first time ever), or None."""
+        wanted = {key: value for key, value in (wanted or {}).items() if value}
+        if not wanted:
+            return None
+        if not self.others or self.others[0] != wanted:
+            log(f"Loading {' and '.join(wanted.values())} (downloaded the first time)")
+            try:
+                self.others = (wanted, singing.OtherEars(self.models_dir, mms=wanted.get('mms'), whisper=wanted.get('whisper'), log=log))
+            except Exception as error:
+                log(f"Couldn't load them ({str(error).splitlines()[0] if str(error) else type(error).__name__}): the singing model alone hears songs here")
+                self.others = (wanted, None)
+        return self.others[1]
+
     def hear(self, job, source, instrumental, target):
         """What's sung in the song (`source` less `instrumental`), if the job says to hear it,
-        saved to `target` (.npy). False if it doesn't, or can't."""
+        saved to `target` (see save_heard in singing.py). False if it doesn't, or can't."""
         if not job.get('hear') or not self.loaded:
             return False
-        import numpy
         _, singing, ears = self.loaded
         vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
             heard = ears.hear(vocals, rate)
-        numpy.save(target, heard.astype(numpy.float32))
+            others = self.other_ears(singing, job.get('others'))
+            more = others.hear(vocals, rate) if others else None
+        singing.save_heard(target, heard, more)
         return True
 
 
