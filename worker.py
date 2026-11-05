@@ -351,6 +351,31 @@ def same_file(a, b):
         return False
 
 
+def pip(action):
+    """The command that installs (or uninstalls) packages for this worker's Python: run.sh's and
+    run.ps1's uv when it has it, or else pip."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    uv = os.path.join(here, '.uv', 'bin', 'uv.exe' if os.name == 'nt' else 'uv')
+    if os.path.exists(uv):
+        return [uv, 'pip', action, '--python', sys.executable, *(['--index-strategy', 'unsafe-best-match'] if action == 'install' else [])]
+    return [sys.executable, '-m', 'pip', action, *(['--no-cache-dir'] if action == 'install' else ['-y'])]
+
+
+def repair_onnxruntime():
+    """With an NVIDIA GPU: ONNX Runtime's CPU-only package, installed beside its GPU one (another
+    package asking for it), takes its place, and vocal removal runs on the CPU. Takes it out, and
+    puts the GPU one back as it was (they share their files). Before ONNX Runtime is loaded."""
+    from importlib import metadata
+    try:
+        gpu = metadata.version('onnxruntime-gpu')
+        metadata.version('onnxruntime')
+    except metadata.PackageNotFoundError:
+        return
+    log("ONNX Runtime's CPU-only package is installed beside its GPU one, so vocal removal would be on the CPU: taking it out")
+    subprocess.run([*pip('uninstall'), 'onnxruntime'], check=True)
+    subprocess.run([*pip('install'), '--force-reinstall', '--no-deps', f'onnxruntime-gpu=={gpu}'], check=True)
+
+
 def update(server, scratch):
     """Starts again with the server's update (its songs are all done): its files (worker.py, and
     what it needs installed, when they changed: not in a git checkout, which is updated with git),
@@ -367,10 +392,7 @@ def update(server, scratch):
         requirements, mine = got.get(f'requirements-{kind}.txt'), os.path.join(here, f'requirements-{kind}.txt')
         if requirements and not same_file(requirements, mine):
             log(f'Installing what the update needs ({kind})')
-            uv = os.path.join(here, '.uv', 'bin', 'uv.exe' if os.name == 'nt' else 'uv')  # run.sh's and run.ps1's
-            command = ([uv, 'pip', 'install', '--python', sys.executable, '--index-strategy', 'unsafe-best-match'] if os.path.exists(uv)
-                       else [sys.executable, '-m', 'pip', 'install', '--no-cache-dir'])
-            subprocess.run([*command, '-r', requirements], check=True)
+            subprocess.run([*pip('install'), '-r', requirements], check=True)
             shutil.copy(requirements, mine)
             if os.path.isdir(os.path.join(here, '.venv')):
                 shutil.copy(requirements, os.path.join(here, '.venv', 'installed'))  # so run.sh doesn't again
@@ -441,6 +463,8 @@ def main():
     # it stops (a worker killed outright leaves it to the system, which clears its temporary files).
     scratch = tempfile.mkdtemp(prefix='jamtube-worker-')
     hearing = Hearing(args.models_dir, scratch)
+    if shutil.which('nvidia-smi'):
+        repair_onnxruntime()
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
     doing = {}  # job id -> job: the songs the slots are doing
     stop = threading.Event()
