@@ -17,6 +17,7 @@ once, from the server.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -196,30 +197,35 @@ class Hearing:
     def __init__(self, models_dir, code_dir):
         self.models_dir = models_dir
         self.code_dir = code_dir
-        self.loaded = None  # (model name, singing module, its Ears)
+        self.loaded = None  # (model name, singing module, its Ears, its code's SHA-1)
         self.lock = threading.Lock()  # shared by the slots: one hears at a time
 
-    def load(self, server, name):
-        """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already."""
-        if not name or (self.loaded and self.loaded[0] == name):
+    def load(self, server, name, code_sha=None):
+        """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already,
+        or its singing.py isn't `code_sha` (the server's changed: see its singingCode)."""
+        if not name or (self.loaded and self.loaded[0] == name and (not code_sha or self.loaded[3].startswith(code_sha))):
             return
         code = os.path.join(self.code_dir, 'singing.py')
         if server.download('/workers/singing.py', code) != 200 or not server.model(name, self.models_dir):
             log("The server doesn't hear the singing here: it does that itself.")
             return
+        with open(code, 'rb') as file:
+            sha = hashlib.sha1(file.read()).hexdigest()
         spec = importlib.util.spec_from_file_location('singing', code)
         singing = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(singing)
-        log(f'Loading {name}')
-        self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
+        log(f'Loading {name}' + (' (the server has a new way of hearing it)' if self.loaded else ''))
+        self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)), sha)
 
-    def hear(self, job, source, instrumental, target):
+    def hear(self, server, job, source, instrumental, target):
         """What's sung in the song (`source` less `instrumental`), if the job says to hear it,
         saved to `target` (.npy). False if it doesn't, or can't."""
         if not job.get('hear') or not self.loaded:
             return False
         import numpy
-        _, singing, ears = self.loaded
+        with self.lock:
+            self.load(server, self.loaded[0], job.get('singingCode'))
+        _, singing, ears, _ = self.loaded
         vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
             heard = ears.hear(vocals, rate)
@@ -263,7 +269,7 @@ def work(server, separators, hearing, job, folder, say):
             separators.put(separator)
         heard = os.path.join(folder, 'heard.npy')
         try:
-            if hearing.hear(job, source, result, heard) and not dropped.is_set():
+            if hearing.hear(server, job, source, result, heard) and not dropped.is_set():
                 say('Heard the singing')
                 server.upload(f"/workers/jobs/{job['id']}/heard", heard)
         except Exception as error:  # the server hears it itself
