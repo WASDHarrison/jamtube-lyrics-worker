@@ -242,18 +242,27 @@ class Hearing:
         singing.save_heard(target, heard)
         return True
 
+    def nothing_more(self, target):
+        """That MMS and Whisper heard nothing, to `target` (see save_others)."""
+        self.loaded[1].save_others(target, {})
+
+    def wants_more(self, job):
+        """Whether the job asks for MMS and Whisper too (`others`), and the singing's heard here."""
+        return bool(job.get('hear') and self.loaded and any((job.get('others') or {}).values()))
+
     def hear_more(self, job, source, instrumental, target):
-        """What MMS and Whisper hear sung in the song, if the job asks (`others`), saved to
-        `target` (see save_others in singing.py). False if it doesn't, or can't."""
-        if not job.get('hear') or not self.loaded or not any((job.get('others') or {}).values()):
-            return False
+        """What MMS and Whisper hear sung in the song (see wants_more), saved to `target` (see
+        save_others in singing.py). False if they can't be loaded."""
         _, singing, _ = self.loaded
         vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
             others = self.other_ears(singing, job.get('others'))
             if not others:
                 return False
-            more = others.hear(vocals, rate)
+            try:
+                more = others.hear(vocals, rate)
+            finally:
+                free_gpu_memory()  # what it held for this song, back for vocal removal
         singing.save_others(target, more)
         return True
 
@@ -306,13 +315,18 @@ def work(server, separators, hearing, job, folder, say):
             return
         status = server.upload(f"/workers/jobs/{job['id']}/result", result)
         say(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
-        others = os.path.join(folder, 'others.npz')
-        try:
-            if status == 204 and hearing.hear_more(job, source, result, others):
-                status = server.upload(f"/workers/jobs/{job['id']}/others", others)
+        if status == 204 and hearing.wants_more(job):
+            others = os.path.join(folder, 'others.npz')
+            try:
+                heard_more = hearing.hear_more(job, source, result, others)
+            except Exception as error:
+                say(f"Couldn't hear it with MMS and Whisper ({str(error)[:300]}).")
+                heard_more = False
+            if not heard_more:  # the song does without them: told so, so it doesn't wait for them
+                hearing.nothing_more(others)
+            status = server.upload(f"/workers/jobs/{job['id']}/others", others)
+            if heard_more:
                 say('Sent what MMS and Whisper heard.' if status == 204 else "Heard with MMS and Whisper, but it's not waited for anymore.")
-        except Exception as error:  # the song does without
-            say(f"Couldn't hear it with MMS and Whisper ({str(error)[:300]}).")
     except Exception as error:  # anything at all: the server gives the song to someone else
         say(f"Couldn't: {str(error)[:300]}")
         give_back(server, job, str(error)[:300])
@@ -441,6 +455,16 @@ def accelerator():
     return 'the CPU'
 
 
+def free_gpu_memory():
+    """PyTorch's GPU memory that's no longer used, given back (it keeps it otherwise)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def gpu_memory_mb():
     """The NVIDIA GPU's memory in MB, or None without one."""
     try:
@@ -450,13 +474,14 @@ def gpu_memory_mb():
     return torch.cuda.get_device_properties(0).total_memory / 2**20 if torch.cuda.is_available() else None
 
 
-def fitting(slots, per_song_mb):
+def fitting(slots, per_song_mb, kept_mb=0):
     """How many songs can have their vocals removed at once: one for each slot, but on an NVIDIA
-    GPU, only as many as its memory fits (each loads the model, and works in GPU memory)."""
+    GPU, only as many as its memory fits (each loads the model, and works in GPU memory), less
+    `kept_mb` kept for hearing the singing with MMS and Whisper."""
     total_mb = gpu_memory_mb()
     if total_mb is None or per_song_mb <= 0:
         return slots
-    return max(1, min(slots, int(total_mb // per_song_mb)))
+    return max(1, min(slots, int((total_mb - kept_mb) // per_song_mb)))
 
 
 def main():
@@ -468,6 +493,8 @@ def main():
                         help="Where the model is kept between runs (or MODELS_DIR; models, next to this).")
     parser.add_argument('--gpu-memory-per-song', type=int, default=int(os.environ.get('GPU_MEMORY_PER_SONG_MB') or 2500),
                         help="GPU memory one song's vocal removal takes, in MB (or GPU_MEMORY_PER_SONG_MB; 2500): on an NVIDIA GPU, only as many songs as fit have their vocals removed at once. 0: one for each slot.")
+    parser.add_argument('--gpu-memory-other-ears', type=int, default=int(os.environ.get('GPU_MEMORY_OTHER_EARS_MB') or 4500),
+                        help="GPU memory MMS and Whisper take, in MB (or GPU_MEMORY_OTHER_EARS_MB; 4500), when the server has them: kept free of vocal removal.")
     args = parser.parse_args()
     if not args.server or not args.key:
         parser.error('Say which server and its WORKER_KEY: --server and --key (or JAMTUBE_LYRICS_URL and WORKER_KEY).')
@@ -512,7 +539,8 @@ def main():
         slots = max(1, int(setup.get('jobs') or 1))
         # The slots download and send back songs side by side, sharing the separators: as many as
         # the GPU's memory fits (each holds its model and works in GPU memory).
-        removing = fitting(slots, args.gpu_memory_per_song)
+        others = any((setup.get('others') or {}).values())  # MMS and Whisper, kept in GPU memory too
+        removing = fitting(slots, args.gpu_memory_per_song, args.gpu_memory_other_ears if others else 0)
         separators = queue.Queue()
         for number in range(removing):
             separators.put(Separator(args.models_dir, os.path.join(scratch, f'out-{number}')))
