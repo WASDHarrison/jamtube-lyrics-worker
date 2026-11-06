@@ -34,6 +34,11 @@ import urllib.error
 import urllib.request
 import uuid
 
+# PyTorch's own GPU kernels only: not the ones it writes with Triton to stand in for some of them
+# (torch._native), which Triton builds with a C compiler the first time, and there's none here
+# ("Failed to find C compiler", Whisper's matrix multiplies). Before anything loads PyTorch.
+os.environ.setdefault('TORCH_DISABLE_NATIVE_JIT', '1')
+
 # Vocal removal's progress bars redraw themselves in place, which only works in a live terminal:
 # in a saved log (a cloud's log viewer, docker logs) each redraw is lines of blank space. So
 # they're only shown in a terminal; its own lines (and the separator's) are logged either way.
