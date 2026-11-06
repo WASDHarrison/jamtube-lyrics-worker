@@ -198,7 +198,7 @@ class Hearing:
         self.models_dir = models_dir
         self.code_dir = code_dir
         self.loaded = None  # (model name, singing module, its Ears)
-        self.others = None  # ({'mms': ..., 'whisper': ...}, their OtherEars, or None if they can't be)
+        self.others = None  # ({'mms': ..., 'whisper': ...}, their OtherEars or why they can't be had)
         self.lock = threading.Lock()  # shared by the slots: one hears at a time
 
     def load(self, server, name):
@@ -217,17 +217,17 @@ class Hearing:
 
     def other_ears(self, singing, wanted):
         """MMS and Whisper as the job wants them (`wanted`: their models), loaded the first time
-        (downloaded the first time ever), or None."""
+        (downloaded the first time ever). Raises why when neither can be loaded."""
         wanted = {key: value for key, value in (wanted or {}).items() if value}
-        if not wanted:
-            return None
         if not self.others or self.others[0] != wanted:
             log(f"Loading {' and '.join(wanted.values())} (downloaded the first time)")
             try:
                 self.others = (wanted, singing.OtherEars(self.models_dir, mms=wanted.get('mms'), whisper=wanted.get('whisper'), log=log))
             except Exception as error:
-                log(f"Couldn't load them ({str(error).splitlines()[0] if str(error) else type(error).__name__}): the singing model alone hears songs here")
-                self.others = (wanted, None)
+                self.others = (wanted, error)  # says which couldn't be loaded, and why
+                log(f"Couldn't load {error}: the singing model alone hears songs here")
+        if isinstance(self.others[1], Exception):
+            raise self.others[1]
         return self.others[1]
 
     def hear(self, job, source, instrumental, target):
@@ -242,9 +242,9 @@ class Hearing:
         singing.save_heard(target, heard)
         return True
 
-    def nothing_more(self, target):
-        """That MMS and Whisper heard nothing, to `target` (see save_others)."""
-        self.loaded[1].save_others(target, {})
+    def nothing_more(self, target, why):
+        """That MMS and Whisper heard nothing, and `why`, to `target` (see save_others)."""
+        self.loaded[1].save_others(target, {'errors': [why]})
 
     def wants_more(self, job):
         """Whether the job asks for MMS and Whisper too (`others`), and the singing's heard here."""
@@ -252,19 +252,19 @@ class Hearing:
 
     def hear_more(self, job, source, instrumental, target):
         """What MMS and Whisper hear sung in the song (see wants_more), saved to `target` (see
-        save_others in singing.py). False if they can't be loaded."""
+        save_others in singing.py). Raises which couldn't hear it, and why."""
         _, singing, _ = self.loaded
-        vocals, rate = singing.vocals_to_hear(source, instrumental)
         with self.lock:
-            others = self.other_ears(singing, job.get('others'))
-            if not others:
-                return False
+            others = self.other_ears(singing, job.get('others'))  # 'MMS (its model): why it can't be loaded; Whisper ...'
             try:
-                more = others.hear(vocals, rate)
+                more = others.hear(*singing.vocals_to_hear(source, instrumental))
+            except Exception as error:
+                raise RuntimeError(f'MMS and Whisper: {singing.first_line(error)}') from error
             finally:
                 free_gpu_memory()  # what it held for this song, back for vocal removal
+        for why in more.get('errors', []):
+            log(f"Couldn't hear it with {why}")
         singing.save_others(target, more)
-        return True
 
 
 def keep_saying(server, job, stop, dropped):
@@ -318,12 +318,13 @@ def work(server, separators, hearing, job, folder, say):
         if status == 204 and hearing.wants_more(job):
             others = os.path.join(folder, 'others.npz')
             try:
-                heard_more = hearing.hear_more(job, source, result, others)
-            except Exception as error:
-                say(f"Couldn't hear it with MMS and Whisper ({str(error)[:300]}).")
+                hearing.hear_more(job, source, result, others)
+                heard_more = True
+            except Exception as error:  # the song does without them: told so, and why, so it doesn't wait for them
+                why = str(error).strip()[:600] or type(error).__name__
+                say(f"Couldn't hear it with {why}.")
+                hearing.nothing_more(others, why)
                 heard_more = False
-            if not heard_more:  # the song does without them: told so, so it doesn't wait for them
-                hearing.nothing_more(others)
             status = server.upload(f"/workers/jobs/{job['id']}/others", others)
             if heard_more:
                 say('Sent what MMS and Whisper heard.' if status == 204 else "Heard with MMS and Whisper, but it's not waited for anymore.")
