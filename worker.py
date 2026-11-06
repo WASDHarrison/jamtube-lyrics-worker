@@ -204,7 +204,10 @@ class Hearing:
         self.code_dir = code_dir
         self.loaded = None  # (model name, singing module, its Ears)
         self.others = None  # ({'mms': ..., 'whisper': ...}, their OtherEars or why they can't be had)
-        self.lock = threading.Lock()  # shared by the slots: one hears at a time
+        self.lock = threading.Lock()  # shared by the slots: one hears with the singing model at a time
+        # MMS and Whisper have their own: a song heard with them (slow) doesn't hold up the next
+        # one being heard with the singing model.
+        self.more_lock = threading.Lock()
 
     def load(self, server, name):
         """Gets the server's singing.py and model `name` (None: it has none), if it hasn't already."""
@@ -235,6 +238,22 @@ class Hearing:
             raise self.others[1]
         return self.others[1]
 
+    def get_ready(self, wanted):
+        """MMS and Whisper loaded as soon as the worker starts (`wanted`: the server's, see
+        /workers/setup), in the background, so the first song doesn't wait for them to load."""
+        if not self.loaded or not any((wanted or {}).values()):
+            return
+
+        def load():
+            with self.more_lock:
+                try:
+                    self.other_ears(self.loaded[1], wanted)
+                except Exception:
+                    pass  # said by other_ears; the first song that asks says so again
+                finally:
+                    free_gpu_memory()
+        threading.Thread(target=load, daemon=True).start()
+
     def hear(self, job, source, instrumental, target):
         """What's sung in the song (`source` less `instrumental`), if the job says to hear it,
         saved to `target` (see save_heard in singing.py). False if it doesn't, or can't."""
@@ -259,7 +278,7 @@ class Hearing:
         """What MMS and Whisper hear sung in the song (see wants_more), saved to `target` (see
         save_others in singing.py). Raises which couldn't hear it, and why."""
         _, singing, _ = self.loaded
-        with self.lock:
+        with self.more_lock:
             others = self.other_ears(singing, job.get('others'))  # 'MMS (its model): why it can't be loaded; Whisper ...'
             try:
                 more = others.hear(*singing.vocals_to_hear(source, instrumental))
@@ -287,8 +306,8 @@ def keep_saying(server, job, stop, dropped):
 def work(server, separators, hearing, job, folder, say):
     """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
     and heard, and both sent back: what was heard first, then the instrumental, which ends it.
-    Then, if it asks, it's heard by MMS and Whisper too, sent after it (the song only waits for
-    that if the singing model wasn't sure of its lyrics).
+    Then, if it asks, it's heard by MMS and Whisper too, in the background (see hear_more), sent
+    after it (the song only waits for that if the singing model wasn't sure of its lyrics).
     Its vocals are taken out by one of `separators` (a queue shared by the slots: as many as the
     GPU's memory fits), waiting for one to be free. `say` logs, saying which slot."""
     started = time.time()
@@ -301,6 +320,10 @@ def work(server, separators, hearing, job, folder, say):
             say('The song was taken back before it was downloaded.')
             return
         separator = separators.get()
+        if dropped.is_set():  # taken back while it waited (for a room's song, say): not started
+            separators.put(separator)
+            say("Not wanted anymore: it's not started.")
+            return
         try:
             say(f"Removing the vocals ({job['separator']}, {job['model']})")
             result = os.path.join(folder, 'instrumental.flac')
@@ -321,23 +344,39 @@ def work(server, separators, hearing, job, folder, say):
         status = server.upload(f"/workers/jobs/{job['id']}/result", result)
         say(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
         if status == 204 and hearing.wants_more(job):
-            others = os.path.join(folder, 'others.npz')
-            try:
-                hearing.hear_more(job, source, result, others)
-                heard_more = True
-            except Exception as error:  # the song does without them: told so, and why, so it doesn't wait for them
-                why = str(error).strip()[:600] or type(error).__name__
-                say(f"Couldn't hear it with {why}.")
-                hearing.nothing_more(others, why)
-                heard_more = False
-            status = server.upload(f"/workers/jobs/{job['id']}/others", others)
-            if heard_more:
-                say('Sent what MMS and Whisper heard.' if status == 204 else "Heard with MMS and Whisper, but it's not waited for anymore.")
+            # Heard with MMS and Whisper in the background, from a folder of its own: the slot
+            # takes its next song straight away (a room's song isn't kept waiting for them).
+            later = tempfile.mkdtemp(prefix='more-', dir=os.path.dirname(folder))
+            shutil.move(source, os.path.join(later, 'song-parts.flac'))
+            shutil.move(result, os.path.join(later, 'instrumental.flac'))
+            threading.Thread(target=hear_more, daemon=True, args=(server, hearing, job, later, say)).start()
     except Exception as error:  # anything at all: the server gives the song to someone else
         say(f"Couldn't: {str(error)[:300]}")
         give_back(server, job, str(error)[:300])
     finally:
         stop.set()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def hear_more(server, hearing, job, folder, say):
+    """What MMS and Whisper hear in a song sent back (its sound and instrumental in `folder`, which
+    goes after), sent after it, or why they couldn't, so it isn't waited for."""
+    try:
+        others = os.path.join(folder, 'others.npz')
+        try:
+            hearing.hear_more(job, os.path.join(folder, 'song-parts.flac'), os.path.join(folder, 'instrumental.flac'), others)
+            heard_more = True
+        except Exception as error:  # the song does without them: told so, and why, so it doesn't wait for them
+            why = str(error).strip()[:600] or type(error).__name__
+            say(f"Couldn't hear it with {why}.")
+            hearing.nothing_more(others, why)
+            heard_more = False
+        status = server.upload(f"/workers/jobs/{job['id']}/others", others)
+        if heard_more:
+            say('Sent what MMS and Whisper heard.' if status == 204 else "Heard with MMS and Whisper, but it's not waited for anymore.")
+    except Exception as error:  # the server stops waiting for them on its own
+        say(f"Couldn't send what MMS and Whisper heard: {str(error)[:300]}")
+    finally:
         shutil.rmtree(folder, ignore_errors=True)
 
 
@@ -557,6 +596,7 @@ def main():
                 for separator in list(separators.queue):
                     separator.load(setup)
                 hearing.load(server, setup.get('singing'))
+                hearing.get_ready(setup.get('others'))
                 fits = f', removing the vocals of {removing} at once (what the GPU\'s memory fits)' if removing < slots else ''
                 log(f"Ready for songs{f', {slots} at once' if slots > 1 else ''}{fits}.")
             except Exception as error:  # the first song tries again

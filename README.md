@@ -12,7 +12,7 @@ Set `WORKER_KEY` in JamTube Lyrics' `.env` to a long random secret (`openssl ran
 
 Workers start from the server, which hands out this worker: keep a copy of this repository next to JamTube Lyrics' folder (`git clone` it beside it, and `git pull` it when you update the server), or say where it is with `WORKER_FILES_DIR`.
 
-A worker hears the singing too, the way the server does (its singing model, and MMS and Whisper when the server's `MMS_MODEL` and `WHISPER_MODEL` say: downloaded the first time, about 1.7 GB, and kept in memory, on the GPU when there is one).
+A worker hears the singing too, the way the server does (its singing model, and MMS and Whisper when the server's `MMS_MODEL` and `WHISPER_MODEL` say: downloaded the first time, about 1.7 GB, loaded as the worker starts, and kept in memory, on the GPU when there is one). A song's sent back as soon as its vocals are out and the singing model's heard it; MMS and Whisper hear it afterwards, in the background, so the worker takes its next song straight away, and they don't hold up the next song's singing model.
 
 Workers keep themselves up to date: when the server's updated (this worker, how it hears the singing, or its settings for workers, such as `MAX_WORKER_JOBS`), a running worker finishes the songs it has, gets the update from the server (installing anything new it needs), and starts again by itself, saying so in its log. Nothing has to be restarted by hand. A worker run from a git checkout of this repository restarts too, but its own files are yours to `git pull`.
 
