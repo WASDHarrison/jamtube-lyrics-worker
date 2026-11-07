@@ -64,7 +64,7 @@ docker run -d --restart unless-stopped --gpus all \
 | `--name` | `WORKER_NAME` | the computer's name | What the server calls it. |
 | `--models-dir` | `MODELS_DIR` | `models`, in its folder | Where the models are kept between runs. |
 | `--gpu-memory-other-ears` | `GPU_MEMORY_OTHER_EARS_MB` | `4500` | GPU memory MMS and Whisper take, in MB, when the server has them (its `MMS_MODEL`, `WHISPER_MODEL`): kept free of vocal removal, so fewer songs may have their vocals removed at once (3 on a 12 GB RTX 3060, still). |
-| `--gpu-memory-per-song` | `GPU_MEMORY_PER_SONG_MB` | `2500` | GPU memory one song's vocal removal takes, in MB. On an NVIDIA GPU, the slots (the server's `MAX_WORKER_JOBS`) download and send back songs side by side, but only as many as the GPU's memory fits remove vocals at once (4 on a 12 GB RTX 3060): the others wait their turn, instead of running out of GPU memory. `0`: one for each slot. |
+| `--gpu-memory-per-song` | `GPU_MEMORY_PER_SONG_MB` | `2500` | GPU memory one song's vocal removal takes, in MB. Nothing about the machine is assumed: it looks at what it runs on as it starts (CPU threads, memory, each GPU and its memory free, in its log). On an NVIDIA GPU, the slots (the server's `MAX_WORKER_JOBS`) download and send back songs side by side, but only as many as the GPU's memory free then fits remove vocals at once (4 on a 12 GB RTX 3060): the others wait their turn, instead of running out of GPU memory. On a CPU (or a Mac's GPU), one at a time, as each takes every core. `0`: one for each slot, whatever it runs on. |
 
 And for the start script (`run.sh`, `run.ps1`):
 

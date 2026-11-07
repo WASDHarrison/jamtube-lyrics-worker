@@ -38,6 +38,9 @@ import uuid
 # (torch._native), which Triton builds with a C compiler the first time, and there's none here
 # ("Failed to find C compiler", Whisper's matrix multiplies). Before anything loads PyTorch.
 os.environ.setdefault('TORCH_DISABLE_NATIVE_JIT', '1')
+# Hugging Face's nag about unauthenticated downloads (MMS and Whisper are public, and downloaded
+# once): not a problem, so not in the log.
+os.environ.setdefault('HF_HUB_VERBOSITY', 'error')
 
 # Vocal removal's progress bars redraw themselves in place, which only works in a live terminal:
 # in a saved log (a cloud's log viewer, docker logs) each redraw is lines of blank space. So
@@ -511,22 +514,55 @@ def free_gpu_memory():
 
 
 def gpu_memory_mb():
-    """The NVIDIA GPU's memory in MB, or None without one."""
+    """The NVIDIA GPU's memory free now, in MB (other programs', and this one's models already
+    loaded, taken off), or None without one."""
     try:
         import torch
     except ImportError:
         return None
-    return torch.cuda.get_device_properties(0).total_memory / 2**20 if torch.cuda.is_available() else None
+    if not torch.cuda.is_available():
+        return None
+    free, _ = torch.cuda.mem_get_info(0)
+    return free / 2**20
+
+
+def machine():
+    """What this worker runs on, as it finds it (nothing assumed: a CPU, any GPU), for the log."""
+    parts = [f'{platform.system()} {platform.machine()}', f'{os.cpu_count() or "?"} CPU threads']
+    try:
+        with open('/proc/meminfo', encoding='utf-8') as meminfo:
+            total_kb = int(next(line for line in meminfo if line.startswith('MemTotal:')).split()[1])
+        parts.append(f'{total_kb / 2**20:.0f} GB RAM')
+    except (OSError, StopIteration, ValueError):
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(index)
+                free, total = torch.cuda.mem_get_info(index)
+                parts.append(f'GPU {index}: {props.name}, {total / 2**30:.1f} GB ({free / 2**30:.1f} GB free)')
+        elif torch.backends.mps.is_available():
+            parts.append("the Mac's GPU (Metal)")
+        else:
+            parts.append('no GPU PyTorch can use')
+    except ImportError:
+        parts.append("PyTorch isn't installed")
+    return ', '.join(parts)
 
 
 def fitting(slots, per_song_mb, kept_mb=0):
-    """How many songs can have their vocals removed at once: one for each slot, but on an NVIDIA
-    GPU, only as many as its memory fits (each loads the model, and works in GPU memory), less
-    `kept_mb` kept for hearing the singing with MMS and Whisper."""
-    total_mb = gpu_memory_mb()
-    if total_mb is None or per_song_mb <= 0:
+    """How many songs can have their vocals removed at once: on an NVIDIA GPU, one for each slot,
+    but only as many as the memory free now fits (each loads the model, and works in GPU memory),
+    less `kept_mb` kept for hearing the singing with MMS and Whisper; on a CPU (or a Mac's GPU),
+    one at a time, as each takes every core (a slot's next song still downloads meanwhile).
+    `per_song_mb` 0: one for each slot, whatever it runs on."""
+    if per_song_mb <= 0:
         return slots
-    return max(1, min(slots, int((total_mb - kept_mb) // per_song_mb)))
+    free_mb = gpu_memory_mb()
+    if free_mb is None:
+        return 1
+    return max(1, min(slots, int((free_mb - kept_mb) // per_song_mb)))
 
 
 def main():
@@ -560,6 +596,7 @@ def main():
     if shutil.which('nvidia-smi'):
         repair_onnxruntime()
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
+    log(f'This machine: {machine()}')
     doing = {}  # job id -> job: the songs the slots are doing
     stop = threading.Event()
     stopped_why = []
@@ -586,6 +623,9 @@ def main():
         # the GPU's memory fits (each holds its model and works in GPU memory).
         others = any((setup.get('others') or {}).values())  # MMS and Whisper, kept in GPU memory too
         removing = fitting(slots, args.gpu_memory_per_song, args.gpu_memory_other_ears if others else 0)
+        log(f"The server sends up to {slots} song{'s' if slots != 1 else ''} at once; {removing} can have their vocals removed at once here"
+            + (f' (about {args.gpu_memory_per_song} MB of GPU memory each, {args.gpu_memory_other_ears} MB kept for MMS and Whisper)' if gpu_memory_mb() is not None and others
+               else f' (about {args.gpu_memory_per_song} MB of GPU memory each)' if gpu_memory_mb() is not None else ' (no NVIDIA GPU: one at a time)'))
         separators = queue.Queue()
         for number in range(removing):
             separators.put(Separator(args.models_dir, os.path.join(scratch, f'out-{number}')))
