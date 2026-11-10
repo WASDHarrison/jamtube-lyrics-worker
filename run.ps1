@@ -61,7 +61,9 @@
     $installed = if (Test-Path .venv\installed) { Get-Content -Raw .venv\installed } else { '' }
     if ((Get-Content -Raw "requirements-$kind.txt") -ne $installed) {
       Write-Host "Installing what it needs ($kind): the first time only, a few minutes"
-      & $uv pip install --python .venv\Scripts\python.exe --index-strategy unsafe-best-match -r "requirements-$kind.txt"
+      # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
+      $torch = if ($kind -eq 'gpu') { '--torch-backend', 'auto', '--reinstall-package', 'torch', '--reinstall-package', 'torchvision' } else { @() }
+      & $uv pip install --python .venv\Scripts\python.exe --index-strategy unsafe-best-match @torch -r "requirements-$kind.txt"
       if ($LASTEXITCODE) { throw "Couldn't install what it needs" }
       Copy-Item "requirements-$kind.txt" .venv\installed
     }

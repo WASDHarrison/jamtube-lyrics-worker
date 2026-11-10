@@ -49,7 +49,10 @@ main() {
   if command -v nvidia-smi >/dev/null 2>&1; then KIND=gpu; else KIND=cpu; fi
   if ! cmp -s "requirements-$KIND.txt" .venv/installed; then
     echo "Installing what it needs ($KIND): the first time only, a few minutes"
-    "$UV" pip install --python .venv/bin/python --index-strategy unsafe-best-match -r "requirements-$KIND.txt"
+    # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
+    if [ "$KIND" = gpu ]; then TORCH="--torch-backend auto --reinstall-package torch --reinstall-package torchvision"; else TORCH=; fi
+    # shellcheck disable=SC2086
+    "$UV" pip install --python .venv/bin/python --index-strategy unsafe-best-match $TORCH -r "requirements-$KIND.txt"
     cp "requirements-$KIND.txt" .venv/installed
   fi
 
