@@ -491,8 +491,10 @@ def accelerator():
     """What vocal removal runs on here, in words, as audio-separator picks it: an NVIDIA GPU when
     PyTorch can use it, a Mac's GPU on Apple silicon, or else the CPU."""
     try:
-        import onnxruntime
+        # PyTorch first: its CUDA build brings the CUDA libraries (cuBLAS, cuDNN, ...) that ONNX
+        # Runtime's GPU build looks for, and loads them as it's imported.
         import torch
+        import onnxruntime
     except ImportError:
         return 'the CPU'
     providers = onnxruntime.get_available_providers()
