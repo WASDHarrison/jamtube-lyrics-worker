@@ -37,7 +37,8 @@
 
   # uv: it brings the right Python and installs what the worker needs, all in this folder. Its
   # settings are only for this, and taken away after.
-  $settings = @{ UV_CACHE_DIR = "$dir\.uv\cache"; UV_PYTHON_INSTALL_DIR = "$dir\.uv\python"; UV_INSTALL_DIR = "$dir\.uv\bin"; UV_NO_MODIFY_PATH = '1' }
+  # JAMTUBE_WORKER_RUNNER: the worker exits with 75 when the server's updated, to be started again here.
+  $settings = @{ UV_CACHE_DIR = "$dir\.uv\cache"; UV_PYTHON_INSTALL_DIR = "$dir\.uv\python"; UV_INSTALL_DIR = "$dir\.uv\bin"; UV_NO_MODIFY_PATH = '1'; JAMTUBE_WORKER_RUNNER = 'run.ps1' }
   $before = @{}
   foreach ($name in $settings.Keys) {
     $before[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -56,19 +57,21 @@
       if ($LASTEXITCODE) { throw "Couldn't set up Python $pythonVersion" }
     }
 
-    # The GPU build with an NVIDIA GPU. .venv\installed is what was installed last.
-    $kind = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { 'gpu' } else { 'cpu' }
-    $installed = if (Test-Path .venv\installed) { Get-Content -Raw .venv\installed } else { '' }
-    if ((Get-Content -Raw "requirements-$kind.txt") -ne $installed) {
-      Write-Host "Installing what it needs ($kind): the first time only, a few minutes"
-      # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
-      $torch = if ($kind -eq 'gpu') { '--torch-backend', 'auto', '--reinstall-package', 'torch', '--reinstall-package', 'torchvision' } else { @() }
-      & $uv pip install --python .venv\Scripts\python.exe --index-strategy unsafe-best-match @torch -r "requirements-$kind.txt"
-      if ($LASTEXITCODE) { throw "Couldn't install what it needs" }
-      Copy-Item "requirements-$kind.txt" .venv\installed
-    }
+    do {
+      # The GPU build with an NVIDIA GPU. .venv\installed is what was installed last.
+      $kind = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { 'gpu' } else { 'cpu' }
+      $installed = if (Test-Path .venv\installed) { Get-Content -Raw .venv\installed } else { '' }
+      if ((Get-Content -Raw "requirements-$kind.txt") -ne $installed) {
+        Write-Host "Installing what it needs ($kind): the first time, or once after an update, a few minutes"
+        # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
+        $torch = if ($kind -eq 'gpu') { '--torch-backend', 'auto', '--reinstall-package', 'torch', '--reinstall-package', 'torchvision' } else { @() }
+        & $uv pip install --python .venv\Scripts\python.exe --index-strategy unsafe-best-match @torch -r "requirements-$kind.txt"
+        if ($LASTEXITCODE) { throw "Couldn't install what it needs" }
+        Copy-Item "requirements-$kind.txt" .venv\installed
+      }
 
-    & .venv\Scripts\python.exe worker.py @workerArgs
+      & .venv\Scripts\python.exe worker.py @workerArgs
+    } while ($LASTEXITCODE -eq 75) # the server was updated: worker.py has the update, start it again
   } finally {
     Pop-Location
     foreach ($name in $before.Keys) { [Environment]::SetEnvironmentVariable($name, $before[$name]) }

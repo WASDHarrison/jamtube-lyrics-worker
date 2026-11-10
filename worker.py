@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shutil
 import signal
 import socket
@@ -445,6 +446,42 @@ def pip(action):
     return [sys.executable, '-m', 'pip', action, *(['--no-cache-dir'] if action == 'install' else ['-y'])]
 
 
+# On Windows a running worker can't replace what it has loaded (PyTorch's files), nor start itself
+# again (execv): run.ps1 starts it again when it exits with UPDATED, installing what the update
+# needs first, and says so in JAMTUBE_WORKER_RUNNER.
+UPDATED = 75
+RESTARTED_BY_RUNNER = os.name == 'nt' and os.environ.get('JAMTUBE_WORKER_RUNNER') == 'run.ps1'
+
+# With an NVIDIA GPU, uv installs PyTorch's CUDA build for this computer's driver (as run.sh and
+# run.ps1 do), in place of any CPU-only one: PyPI's for Windows has no CUDA.
+CUDA_TORCH = ['--torch-backend', 'auto', '--reinstall-package', 'torch', '--reinstall-package', 'torchvision']
+
+
+def torch_has_cuda():
+    """Whether the PyTorch installed here is a CUDA build (None: no PyTorch), without loading it
+    (Windows can't replace a loaded one's files): its version.py says which CUDA, or None."""
+    spec = importlib.util.find_spec('torch')
+    if not spec or not spec.submodule_search_locations:
+        return None
+    try:
+        with open(os.path.join(spec.submodule_search_locations[0], 'version.py')) as file:
+            found = re.search(r'^cuda\b[^=]*=\s*(.+)$', file.read(), re.MULTILINE)
+    except OSError:
+        return None
+    return bool(found) and found.group(1).strip() != 'None'
+
+
+def repair_torch():
+    """With an NVIDIA GPU: a CPU-only PyTorch (set up before run.ps1 asked for the CUDA one) means
+    vocal removal on the CPU. Puts the CUDA build for this driver in its place, with uv. Before
+    PyTorch is loaded."""
+    command = pip('install')
+    if torch_has_cuda() is not False or command[0] == sys.executable:  # (pip has no --torch-backend)
+        return
+    log("PyTorch here is its CPU-only build, so vocal removal would be on the CPU: installing its CUDA build (a few minutes, once)")
+    subprocess.run([*command, *CUDA_TORCH, 'torch', 'torchvision'], check=True)
+
+
 def repair_onnxruntime():
     """With an NVIDIA GPU: ONNX Runtime's CPU-only package, installed beside its GPU one (another
     package asking for it), takes its place, and vocal removal runs on the CPU. Takes it out, and
@@ -474,9 +511,13 @@ def update(server, scratch):
             if server.download(f'/workers/files/{name}', os.path.join(scratch, name)) == 200:
                 got[name] = os.path.join(scratch, name)
         requirements, mine = got.get(f'requirements-{kind}.txt'), os.path.join(here, f'requirements-{kind}.txt')
-        if requirements and not same_file(requirements, mine):
+        if requirements and not same_file(requirements, mine) and RESTARTED_BY_RUNNER:
+            shutil.copy(requirements, mine)  # run.ps1 installs it, with nothing loaded
+        elif requirements and not same_file(requirements, mine):
             log(f'Installing what the update needs ({kind})')
-            subprocess.run([*pip('install'), '-r', requirements], check=True)
+            command = pip('install')
+            cuda = CUDA_TORCH if kind == 'gpu' and command[0] != sys.executable else []
+            subprocess.run([*command, *cuda, '-r', requirements], check=True)
             shutil.copy(requirements, mine)
             if os.path.isdir(os.path.join(here, '.venv')):
                 shutil.copy(requirements, os.path.join(here, '.venv', 'installed'))  # so run.sh doesn't again
@@ -484,7 +525,12 @@ def update(server, scratch):
             os.replace(got['worker.py'], os.path.abspath(__file__))
     log('Starting again with the update.')
     shutil.rmtree(scratch, ignore_errors=True)
-    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+    if RESTARTED_BY_RUNNER:
+        sys.exit(UPDATED)
+    command = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
+    if os.name == 'nt':  # Windows' execv doesn't quote: a folder with a space ("Harrison Chen") broke in two
+        sys.exit(subprocess.run(command).returncode)
+    os.execv(sys.executable, command)
 
 
 def accelerator():
@@ -594,6 +640,8 @@ def main():
     # This run's one temporary folder: each slot's song, and its vocal removal's output. Gone when
     # it stops (a worker killed outright leaves it to the system, which clears its temporary files).
     scratch = tempfile.mkdtemp(prefix='jamtube-worker-')
+    if shutil.which('nvidia-smi'):
+        repair_torch()
     hearing = Hearing(args.models_dir, scratch)
     if shutil.which('nvidia-smi'):
         repair_onnxruntime()
