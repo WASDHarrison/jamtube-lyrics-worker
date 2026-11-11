@@ -57,6 +57,7 @@
       if ($LASTEXITCODE) { throw "Couldn't set up Python $pythonVersion" }
     }
 
+    $restarted = $false
     do {
       # The GPU build with an NVIDIA GPU. .venv\installed is what was installed last.
       $kind = if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) { 'gpu' } else { 'cpu' }
@@ -66,11 +67,17 @@
         # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
         $torch = if ($kind -eq 'gpu') { '--torch-backend', 'auto', '--reinstall-package', 'torch', '--reinstall-package', 'torchvision' } else { @() }
         & $uv pip install --python .venv\Scripts\python.exe --index-strategy unsafe-best-match @torch -r "requirements-$kind.txt"
-        if ($LASTEXITCODE) { throw "Couldn't install what it needs" }
-        Copy-Item "requirements-$kind.txt" .venv\installed
+        if ($LASTEXITCODE) {
+          # After an update, with what it had installed: tried again at the next one, or start.
+          if (-not $restarted) { throw "Couldn't install what it needs" }
+          Write-Host "Couldn't install what the update needs: starting with what's installed, trying again next time"
+        } else {
+          Copy-Item "requirements-$kind.txt" .venv\installed
+        }
       }
 
       & .venv\Scripts\python.exe worker.py @workerArgs
+      $restarted = $true
     } while ($LASTEXITCODE -eq 75) # the server was updated: worker.py has the update, start it again
   } finally {
     Pop-Location

@@ -45,18 +45,34 @@ main() {
     "$UV" venv --quiet --python "$PYTHON_VERSION" .venv
   fi
 
-  # The GPU build with an NVIDIA GPU. .venv/installed is what was installed last.
-  if command -v nvidia-smi >/dev/null 2>&1; then KIND=gpu; else KIND=cpu; fi
-  if ! cmp -s "requirements-$KIND.txt" .venv/installed; then
-    echo "Installing what it needs ($KIND): the first time only, a few minutes"
-    # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
-    if [ "$KIND" = gpu ]; then TORCH="--torch-backend auto --reinstall-package torch --reinstall-package torchvision"; else TORCH=; fi
-    # shellcheck disable=SC2086
-    "$UV" pip install --python .venv/bin/python --index-strategy unsafe-best-match $TORCH -r "requirements-$KIND.txt"
-    cp "requirements-$KIND.txt" .venv/installed
-  fi
+  # The worker exits with 75 when the server's updated (worker.py has the update): what it needs
+  # is installed, with nothing loaded, and it's started again.
+  export JAMTUBE_WORKER_RUNNER=run.sh
+  RESTARTED=''
+  while :; do
+    # The GPU build with an NVIDIA GPU. .venv/installed is what was installed last.
+    if command -v nvidia-smi >/dev/null 2>&1; then KIND=gpu; else KIND=cpu; fi
+    if ! cmp -s "requirements-$KIND.txt" .venv/installed; then
+      echo "Installing what it needs ($KIND): the first time, or once after an update, a few minutes"
+      # With a GPU, PyTorch's CUDA build for this driver, in place of any CPU-only one already here.
+      if [ "$KIND" = gpu ]; then TORCH="--torch-backend auto --reinstall-package torch --reinstall-package torchvision"; else TORCH=; fi
+      # shellcheck disable=SC2086
+      if "$UV" pip install --python .venv/bin/python --index-strategy unsafe-best-match $TORCH -r "requirements-$KIND.txt"; then
+        cp "requirements-$KIND.txt" .venv/installed
+      elif [ -z "$RESTARTED" ]; then
+        echo "Couldn't install what it needs" >&2
+        exit 1
+      else
+        # After an update, with what it had installed: tried again at the next one.
+        echo "Couldn't install what the update needs: starting with what's installed, trying again next time"
+      fi
+    fi
 
-  exec .venv/bin/python worker.py "$@"
+    STATUS=0
+    .venv/bin/python worker.py "$@" || STATUS=$?
+    [ "$STATUS" -eq 75 ] || exit "$STATUS"
+    RESTARTED=1
+  done
 }
 
 main "$@"

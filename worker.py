@@ -446,11 +446,13 @@ def pip(action):
     return [sys.executable, '-m', 'pip', action, *(['--no-cache-dir'] if action == 'install' else ['-y'])]
 
 
-# On Windows a running worker can't replace what it has loaded (PyTorch's files), nor start itself
-# again (execv): run.ps1 starts it again when it exits with UPDATED, installing what the update
-# needs first, and says so in JAMTUBE_WORKER_RUNNER.
+# Started by run.sh or run.ps1 (they say so in JAMTUBE_WORKER_RUNNER), it exits with UPDATED when
+# the server's updated, and they install what the update needs, with nothing loaded (Windows can't
+# replace PyTorch's files while they are), and start it again. Otherwise (a container, by hand) it
+# installs it itself and starts itself again.
 UPDATED = 75
-RESTARTED_BY_RUNNER = os.name == 'nt' and os.environ.get('JAMTUBE_WORKER_RUNNER') == 'run.ps1'
+RESTARTED_BY_RUNNER = bool(os.environ.get('JAMTUBE_WORKER_RUNNER'))
+UPDATE_TRIES = 60  # the update's files, asked for every RETRY_SECONDS[-1] (the server may be restarting)
 
 # With an NVIDIA GPU, uv installs PyTorch's CUDA build for this computer's driver (as run.sh and
 # run.ps1 do), in place of any CPU-only one: PyPI's for Windows has no CUDA.
@@ -508,8 +510,18 @@ def update(server, scratch):
     else:
         got = {}
         for name in ('worker.py', f'requirements-{kind}.txt'):
-            if server.download(f'/workers/files/{name}', os.path.join(scratch, name)) == 200:
-                got[name] = os.path.join(scratch, name)
+            for _ in range(UPDATE_TRIES):
+                try:
+                    status = server.download(f'/workers/files/{name}', os.path.join(scratch, name))
+                except OSError as error:  # the server restarting with its update
+                    status = error
+                if status == 200:
+                    got[name] = os.path.join(scratch, name)
+                    break
+                if status == 404:  # (it hasn't got it: no WORKER_FILES_DIR)
+                    break
+                log(f"Couldn't get the update's {name} ({status}): trying again in {RETRY_SECONDS[-1]}s")
+                time.sleep(RETRY_SECONDS[-1])
         requirements, mine = got.get(f'requirements-{kind}.txt'), os.path.join(here, f'requirements-{kind}.txt')
         if requirements and not same_file(requirements, mine) and RESTARTED_BY_RUNNER:
             shutil.copy(requirements, mine)  # run.ps1 installs it, with nothing loaded
