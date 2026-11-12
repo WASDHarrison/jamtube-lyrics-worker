@@ -39,8 +39,8 @@ import uuid
 # (torch._native), which Triton builds with a C compiler the first time, and there's none here
 # ("Failed to find C compiler", Whisper's matrix multiplies). Before anything loads PyTorch.
 os.environ.setdefault('TORCH_DISABLE_NATIVE_JIT', '1')
-# Hugging Face's nag about unauthenticated downloads (MMS and Whisper are public, and downloaded
-# once): not a problem, so not in the log.
+# Hugging Face's nag about unauthenticated downloads (Whisper is public, and downloaded once): not
+# a problem, so not in the log.
 os.environ.setdefault('HF_HUB_VERBOSITY', 'error')
 
 # Vocal removal's progress bars redraw themselves in place, which only works in a live terminal:
@@ -200,20 +200,20 @@ class Separator:
 
 class Hearing:
     """Hears what's sung in a song's vocals the way the server does: its singing.py and its
-    singing model, both from the server (see /workers/setup there), and MMS and Whisper when a
-    job asks for them (see OtherEars in singing.py). Off when it has none."""
+    singing model, both from the server (see /workers/setup there), and Whisper when a job asks
+    for it (see Whisper in singing.py). Off when it has none."""
 
     def __init__(self, models_dir, code_dir):
         self.models_dir = models_dir
         self.code_dir = code_dir
         self.loaded = None  # (model name, singing module, its Ears)
-        self.others = None  # ({'mms': ..., 'whisper': ...}, their OtherEars or why they can't be had)
+        self.whisper = None  # (its model, singing.Whisper or why it can't be had)
         self.lock = threading.Lock()  # shared by the slots: one hears with the singing model at a time
-        # MMS and Whisper have their own: a song heard with them (slow) doesn't hold up the next
-        # one being heard with the singing model.
-        self.more_lock = threading.Lock()
-        # Songs sent back, to hear with MMS and Whisper (see hear_later): [(server, job, folder,
-        # say)], heard one at a time, songs the server's waiting for first.
+        # Whisper has its own: a song read with it (slower) doesn't hold up the next one being
+        # heard with the singing model.
+        self.whisper_lock = threading.Lock()
+        # Songs sent back, to read with Whisper (see read_later): [(server, job, folder, say)],
+        # read one at a time, songs the server's waiting for first.
         self.later = []
         self.later_ready = threading.Condition()
         self.later_thread = None
@@ -232,33 +232,32 @@ class Hearing:
         log(f'Loading {name}')
         self.loaded = (name, singing, singing.Ears(os.path.join(self.models_dir, name)))
 
-    def other_ears(self, singing, wanted):
-        """MMS and Whisper as the job wants them (`wanted`: their models), loaded the first time
-        (downloaded the first time ever). Raises why when neither can be loaded."""
-        wanted = {key: value for key, value in (wanted or {}).items() if value}
-        if not self.others or self.others[0] != wanted:
-            log(f"Loading {' and '.join(wanted.values())} (downloaded the first time)")
+    def whisper_for(self, model):
+        """Whisper (`model`), loaded the first time (downloaded the first time ever). Raises why
+        it can't be."""
+        if not self.whisper or self.whisper[0] != model:
+            log(f'Loading Whisper ({model}; downloaded the first time)')
             try:
-                self.others = (wanted, singing.OtherEars(self.models_dir, mms=wanted.get('mms'), whisper=wanted.get('whisper'), log=log))
+                self.whisper = (model, self.loaded[1].Whisper(self.models_dir, model))
             except Exception as error:
-                self.others = (wanted, error)  # says which couldn't be loaded, and why
-                log(f"Couldn't load {error}: the singing model alone hears songs here")
-        if isinstance(self.others[1], Exception):
-            raise self.others[1]
-        return self.others[1]
+                self.whisper = (model, error)
+                log(f"Couldn't load Whisper ({error}): the singing model alone hears songs here")
+        if isinstance(self.whisper[1], Exception):
+            raise self.whisper[1]
+        return self.whisper[1]
 
-    def get_ready(self, wanted):
-        """MMS and Whisper loaded as soon as the worker starts (`wanted`: the server's, see
-        /workers/setup), in the background, so the first song doesn't wait for them to load."""
-        if not self.loaded or not any((wanted or {}).values()):
+    def get_ready(self, model):
+        """Whisper loaded as soon as the worker starts (`model`: the server's, see /workers/setup),
+        in the background, so the first song doesn't wait for it to load."""
+        if not self.loaded or not model:
             return
 
         def load():
-            with self.more_lock:
+            with self.whisper_lock:
                 try:
-                    self.other_ears(self.loaded[1], wanted)
+                    self.whisper_for(model)
                 except Exception:
-                    pass  # said by other_ears; the first song that asks says so again
+                    pass  # said by whisper_for; the first song that asks says so again
                 finally:
                     free_gpu_memory()
         threading.Thread(target=load, daemon=True).start()
@@ -275,55 +274,45 @@ class Hearing:
         singing.save_heard(target, heard)
         return True
 
-    def nothing_more(self, target, why):
-        """That MMS and Whisper heard nothing, and `why`, to `target` (see save_others)."""
-        self.loaded[1].save_others(target, {'errors': [why]})
+    def wants_whisper(self, job):
+        """Whether the job asks for Whisper too, and the singing's heard here."""
+        return bool(job.get('hear') and self.loaded and job.get('whisper'))
 
-    def wants_more(self, job):
-        """Whether the job asks for MMS and Whisper too (`others`), and the singing's heard here."""
-        return bool(job.get('hear') and self.loaded and any((job.get('others') or {}).values()))
-
-    def hear_more(self, job, source, instrumental, target, news):
-        """What MMS and Whisper hear sung in the song (see wants_more), saved to `target` (see
-        save_others in singing.py). Raises which couldn't hear it, and why. `news` says how it's
-        going (to the log here and the server's)."""
-        _, singing, _ = self.loaded
-        with self.more_lock:
-            if not self.others or self.others[0] != {key: value for key, value in (job.get('others') or {}).items() if value}:
-                news(f'Loading {" and ".join(value for value in (job.get("others") or {}).values() if value)} first{gpu_memory_note()}')
+    def read(self, job, source, instrumental, target, news):
+        """What Whisper reads sung in the song (see wants_whisper), saved to `target` (see
+        save_whisper in singing.py). Raises why it couldn't. `news` says how it's going (to the
+        log here and the server's)."""
+        singing = self.loaded[1]
+        with self.whisper_lock:
+            if not self.whisper or self.whisper[0] != job['whisper']:
+                news(f"Loading Whisper ({job['whisper']}) first{gpu_memory_note()}")
             started = time.time()
-            others = self.other_ears(singing, job.get('others'))  # 'MMS (its model): why it can't be loaded; Whisper ...'
+            whisper = self.whisper_for(job['whisper'])
             if time.time() - started > 1:
-                news(f'Loaded them in {time.time() - started:.0f}s{gpu_memory_note()}')
-            news(f'Hearing it with MMS and Whisper{gpu_memory_note()}')
-            started = time.time()
+                news(f'Loaded it in {time.time() - started:.0f}s{gpu_memory_note()}')
+            news(f'Reading it with Whisper{gpu_memory_note()}')
             reset_gpu_peak()
             try:
-                more = others.hear(*singing.vocals_to_hear(source, instrumental))
+                read = whisper.hear(*singing.vocals_to_hear(source, instrumental))
             except Exception as error:
-                raise RuntimeError(f'MMS and Whisper: {singing.first_line(error)}{gpu_memory_note(peak=True)}') from error
+                raise RuntimeError(f'{singing.first_line(error)}{gpu_memory_note(peak=True)}') from error
             finally:
                 free_gpu_memory()  # what it held for this song, back for vocal removal
-        took = more.get('seconds') or {}
-        heard = [f'MMS {len(more["mms"])} frames' + (f' in {took["mms"]:.0f}s' if took.get('mms') is not None else '') if more.get('mms') is not None else '',
-                 f'Whisper {len(more["whisper"])} words' + (f' in {took["whisper"]:.0f}s' if took.get('whisper') is not None else '') if more.get('whisper') is not None else '']
-        news(f"Heard it in {time.time() - started:.0f}s: {', '.join(part for part in heard if part) or 'nothing'}{gpu_memory_note(peak=True)}")
-        for why in more.get('errors', []):
-            news(f"Couldn't hear it with {why}")
-        singing.save_others(target, more)
+        news(f"Read {len(read['words'])} words in {read['seconds']:.0f}s{gpu_memory_note(peak=True)}")
+        singing.save_whisper(target, read)
 
-    def hear_later(self, server, job, folder, say):
-        """Hears a song sent back with MMS and Whisper (see hear_more), in turn: one at a time, a
-        song the server's waiting for (the singing model wasn't sure of its lyrics) before songs
-        it may not need, and songs it no longer needs (made without them) not at all."""
+    def read_later(self, server, job, folder, say):
+        """Reads a song sent back with Whisper (see read_sent), in turn: one at a time, a song the
+        server's waiting for (the singing model wasn't sure of its lyrics) before songs it may not
+        need, and songs it no longer needs (made without it) not at all."""
         with self.later_ready:
             self.later.append((server, job, folder, say))
             self.later_ready.notify()
             if not self.later_thread or not self.later_thread.is_alive():
-                self.later_thread = threading.Thread(target=self.hear_in_turn, daemon=True)
+                self.later_thread = threading.Thread(target=self.read_in_turn, daemon=True)
                 self.later_thread.start()
 
-    def hear_in_turn(self):
+    def read_in_turn(self):
         while True:
             with self.later_ready:
                 while not self.later:
@@ -333,7 +322,7 @@ class Hearing:
             answers = [(entry, still_wanted(entry[0], entry[1])) for entry in waiting]
             for entry, answer in answers:
                 if answer == 'no':
-                    entry[3]("Not heard with MMS and Whisper: the song's made without them.")
+                    entry[3]("Not read with Whisper: the song's made without it.")
                     self.drop_later(entry)
             choice = next((entry for entry, answer in answers if answer == 'wanted'), None) \
                 or next((entry for entry, answer in answers if answer == 'maybe'), None)
@@ -342,7 +331,7 @@ class Hearing:
                 continue
             self.drop_later(choice, remove=False)
             server, job, folder, say = choice
-            hear_more(server, self, job, folder, say)
+            read_sent(server, self, job, folder, say)
 
     def drop_later(self, entry, remove=True):
         with self.later_ready:
@@ -367,7 +356,7 @@ def keep_saying(server, job, stop, dropped):
 def work(server, separators, hearing, job, folder, say):
     """Does a job: its song is downloaded into `folder` (emptied after), its vocals taken out
     and heard, and both sent back: what was heard first, then the instrumental, which ends it.
-    Then, if it asks, it's heard by MMS and Whisper too, in the background (see hear_more), sent
+    Then, if it asks, it's read by Whisper too, in the background (see read_sent), sent
     after it (the song only waits for that if the singing model wasn't sure of its lyrics).
     Its vocals are taken out by one of `separators` (a queue shared by the slots: as many as the
     GPU's memory fits), waiting for one to be free. `say` logs, saying which slot."""
@@ -408,13 +397,13 @@ def work(server, separators, hearing, job, folder, say):
             return
         status = server.upload(f"/workers/jobs/{job['id']}/result", result)
         say(f'Sent back, {time.time() - started:.0f}s in all.' if status == 204 else f"Done, but it's not wanted anymore ({status}).")
-        if status == 204 and hearing.wants_more(job):
-            # Heard with MMS and Whisper in the background, from a folder of its own: the slot
-            # takes its next song straight away (a room's song isn't kept waiting for them).
-            later = tempfile.mkdtemp(prefix='more-', dir=os.path.dirname(folder))
+        if status == 204 and hearing.wants_whisper(job):
+            # Read with Whisper in the background, from a folder of its own: the slot takes its
+            # next song straight away (a room's song isn't kept waiting for it).
+            later = tempfile.mkdtemp(prefix='whisper-', dir=os.path.dirname(folder))
             shutil.move(source, os.path.join(later, 'song-parts.flac'))
             shutil.move(result, os.path.join(later, 'instrumental.flac'))
-            hearing.hear_later(server, job, later, say)
+            hearing.read_later(server, job, later, say)
     except Exception as error:  # anything at all: the server gives the song to someone else
         tell(f"Couldn't: {str(error)[:300]}{gpu_memory_note()}")
         give_back(server, job, str(error)[:300])
@@ -425,7 +414,7 @@ def work(server, separators, hearing, job, folder, say):
 
 def news_for(server, job, say):
     """Says `text` here (`say`) and in the server's log, with the job's song (see /news there:
-    while MMS and Whisper hear it, it also keeps the song waiting for them)."""
+    while Whisper reads it, it also keeps the song waiting for it)."""
     def news(text):
         say(text)
         try:
@@ -436,16 +425,16 @@ def news_for(server, job, say):
 
 
 def still_wanted(server, job):
-    """Whether the server still wants what MMS and Whisper hear in a song sent back: 'wanted' (the
+    """Whether the server still wants what Whisper reads in a song sent back: 'wanted' (the
     song's waiting for it), 'maybe' (not yet: the singing model may be sure), 'no' (the song's
     made), or None (the server can't be reached just now)."""
     try:
-        status, body = server.request('GET', f"/workers/jobs/{job['id']}/others", timeout=15)
+        status, body = server.request('GET', f"/workers/jobs/{job['id']}/whisper", timeout=15)
     except OSError:
         return None
     if status == 410:
         return 'no'
-    if status != 200:  # a server from before it said: as before, heard
+    if status != 200:
         return 'wanted'
     try:
         return 'wanted' if json.loads(body).get('wanted') else 'maybe'
@@ -453,27 +442,27 @@ def still_wanted(server, job):
         return 'wanted'
 
 
-def hear_more(server, hearing, job, folder, say):
-    """What MMS and Whisper hear in a song sent back (its sound and instrumental in `folder`, which
-    goes after), sent after it, or why they couldn't, so it isn't waited for."""
+def read_sent(server, hearing, job, folder, say):
+    """What Whisper reads in a song sent back (its sound and instrumental in `folder`, which goes
+    after), sent after it, or why it couldn't, so it isn't waited for."""
     news = news_for(server, job, say)
     try:
-        others = os.path.join(folder, 'others.npz')
+        target = os.path.join(folder, 'whisper.json')
         try:
-            hearing.hear_more(job, os.path.join(folder, 'song-parts.flac'), os.path.join(folder, 'instrumental.flac'), others, news)
-            heard_more = True
-        except Exception as error:  # the song does without them: told so, and why, so it doesn't wait for them
+            hearing.read(job, os.path.join(folder, 'song-parts.flac'), os.path.join(folder, 'instrumental.flac'), target, news)
+            read = True
+        except Exception as error:  # the song does without it: told so, and why, so it doesn't wait for it
             why = str(error).strip()[:600] or type(error).__name__
-            news(f"Couldn't hear it with {why}")
-            hearing.nothing_more(others, why)
-            heard_more = False
+            news(f"Couldn't read it with Whisper: {why}")
+            hearing.loaded[1].save_whisper(target, {'error': why})
+            read = False
         started = time.time()
-        status = server.upload(f"/workers/jobs/{job['id']}/others", others)
-        if heard_more:
-            say(f'Sent what MMS and Whisper heard ({time.time() - started:.1f}s).' if status == 204
-                else "Heard with MMS and Whisper, but it's not needed anymore (the song's made).")
-    except Exception as error:  # the server stops waiting for them on its own
-        say(f"Couldn't send what MMS and Whisper heard: {str(error)[:300]}")
+        status = server.upload(f"/workers/jobs/{job['id']}/whisper", target)
+        if read:
+            say(f'Sent what Whisper read ({time.time() - started:.1f}s).' if status == 204
+                else "Read with Whisper, but it's not needed anymore (the song's made).")
+    except Exception as error:  # the server stops waiting for it on its own
+        say(f"Couldn't send what Whisper read: {str(error)[:300]}")
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
@@ -732,7 +721,7 @@ def machine():
 def fitting(slots, per_song_mb, kept_mb=0):
     """How many songs can have their vocals removed at once: on an NVIDIA GPU, one for each slot,
     but only as many as the memory free now fits (each loads the model, and works in GPU memory),
-    less `kept_mb` kept for hearing the singing with MMS and Whisper; on a CPU (or a Mac's GPU),
+    less `kept_mb` kept for reading the singing with Whisper; on a CPU (or a Mac's GPU),
     one at a time, as each takes every core (a slot's next song still downloads meanwhile).
     `per_song_mb` 0: one for each slot, whatever it runs on."""
     if per_song_mb <= 0:
@@ -752,8 +741,8 @@ def main():
                         help="Where the model is kept between runs (or MODELS_DIR; models, next to this).")
     parser.add_argument('--gpu-memory-per-song', type=int, default=int(os.environ.get('GPU_MEMORY_PER_SONG_MB') or 2500),
                         help="GPU memory one song's vocal removal takes, in MB (or GPU_MEMORY_PER_SONG_MB; 2500): on an NVIDIA GPU, only as many songs as fit have their vocals removed at once. 0: one for each slot.")
-    parser.add_argument('--gpu-memory-other-ears', type=int, default=int(os.environ.get('GPU_MEMORY_OTHER_EARS_MB') or 4500),
-                        help="GPU memory MMS and Whisper take, in MB (or GPU_MEMORY_OTHER_EARS_MB; 4500), when the server has them: kept free of vocal removal.")
+    parser.add_argument('--gpu-memory-whisper', type=int, default=int(os.environ.get('GPU_MEMORY_WHISPER_MB') or 4500),
+                        help="GPU memory Whisper takes, in MB (or GPU_MEMORY_WHISPER_MB; 4500), when the server has it: kept free of vocal removal.")
     args = parser.parse_args()
     if not args.server or not args.key:
         parser.error('Say which server and its WORKER_KEY: --server and --key (or JAMTUBE_LYRICS_URL and WORKER_KEY).')
@@ -801,10 +790,10 @@ def main():
         slots = max(1, int(setup.get('jobs') or 1))
         # The slots download and send back songs side by side, sharing the separators: as many as
         # the GPU's memory fits (each holds its model and works in GPU memory).
-        others = any((setup.get('others') or {}).values())  # MMS and Whisper, kept in GPU memory too
-        removing = fitting(slots, args.gpu_memory_per_song, args.gpu_memory_other_ears if others else 0)
+        whisper = setup.get('whisper') or ''  # kept in GPU memory too
+        removing = fitting(slots, args.gpu_memory_per_song, args.gpu_memory_whisper if whisper else 0)
         log(f"The server sends up to {slots} song{'s' if slots != 1 else ''} at once; {removing} can have their vocals removed at once here"
-            + (f' (about {args.gpu_memory_per_song} MB of GPU memory each, {args.gpu_memory_other_ears} MB kept for MMS and Whisper)' if gpu_memory_mb() is not None and others
+            + (f' (about {args.gpu_memory_per_song} MB of GPU memory each, {args.gpu_memory_whisper} MB kept for Whisper)' if gpu_memory_mb() is not None and whisper
                else f' (about {args.gpu_memory_per_song} MB of GPU memory each)' if gpu_memory_mb() is not None else ' (no NVIDIA GPU: one at a time)'))
         separators = queue.Queue()
         for number in range(removing):
@@ -816,7 +805,7 @@ def main():
                 for separator in list(separators.queue):
                     separator.load(setup)
                 hearing.load(server, setup.get('singing'))
-                hearing.get_ready(setup.get('others'))
+                hearing.get_ready(whisper)
                 fits = f', removing the vocals of {removing} at once (what the GPU\'s memory fits)' if removing < slots else ''
                 log(f"Ready for songs{f', {slots} at once' if slots > 1 else ''}{fits}.")
             except Exception as error:  # the first song tries again

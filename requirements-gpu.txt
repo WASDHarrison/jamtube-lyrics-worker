@@ -7,6 +7,6 @@ audio-separator[gpu]
 audioread
 # ffmpeg, for computers without it.
 imageio-ffmpeg
-# MMS and Whisper, more ways the lyrics are lined up with the singing (the server's MMS_MODEL and
-# WHISPER_MODEL say which).
+# Whisper, one more way the lyrics are lined up with the singing (the server's WHISPER_MODEL says
+# which).
 transformers
