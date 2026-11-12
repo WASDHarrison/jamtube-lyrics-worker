@@ -304,8 +304,9 @@ class Hearing:
                 raise RuntimeError(f'MMS and Whisper: {singing.first_line(error)}{gpu_memory_note(peak=True)}') from error
             finally:
                 free_gpu_memory()  # what it held for this song, back for vocal removal
-        heard = [f'MMS {len(more["mms"])} frames' if more.get('mms') is not None else '',
-                 f'Whisper {len(more["whisper"])} words' if more.get('whisper') is not None else '']
+        took = more.get('seconds') or {}
+        heard = [f'MMS {len(more["mms"])} frames' + (f' in {took["mms"]:.0f}s' if took.get('mms') is not None else '') if more.get('mms') is not None else '',
+                 f'Whisper {len(more["whisper"])} words' + (f' in {took["whisper"]:.0f}s' if took.get('whisper') is not None else '') if more.get('whisper') is not None else '']
         news(f"Heard it in {time.time() - started:.0f}s: {', '.join(part for part in heard if part) or 'nothing'}{gpu_memory_note(peak=True)}")
         for why in more.get('errors', []):
             news(f"Couldn't hear it with {why}")
