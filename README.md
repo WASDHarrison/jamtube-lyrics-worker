@@ -18,6 +18,14 @@ Workers keep themselves up to date: when the server's updated (this worker, how 
 
 `GET /health` on the server lists the workers connected right now (`workers`).
 
+### Whole songs
+
+A worker makes whole songs too when the server gives it one (its `WORKER_SONGS`, on by default), not only their vocals removed: it runs the server's own `prepare.py` (fetched from the server, again only when it changes), which downloads the song, finds its lyrics and official audio, matches them and encodes it, while the worker removes the vocals, hears the singing and reads it with Whisper on its GPU, as it does for songs sent to it. What's made is sent to the server, which only keeps it. So the server's own CPU and memory don't limit how many songs are made at once: each worker adds as many as its slots (`MAX_WORKER_JOBS`).
+
+A cloud GPU's address is often blocked by YouTube, so the song asks YouTube as the server does: the server's downloaders first (what one downloads, the worker fetches from the server), then the server's residential proxy (`YOUTUBE_PROXY`, sent with each song), and only then from the worker's own address. If anything goes wrong on the worker, the song goes back to the server, which starts it again on another worker or makes it itself.
+
+It needs what the server's `prepare.py` needs: the packages in `requirements-gpu.txt` (and `-cpu.txt`: yt-dlp, the romanizers, Deno for yt-dlp and the rest), ffmpeg and ffprobe (the computer's, or else static-ffmpeg's, downloaded once), and the server's singing model loaded. It says as it starts whether it makes whole songs ("It makes whole songs too…"), or what it lacks to. Without them, or started with `--no-songs`, it only removes vocals.
+
 ## Starting a worker
 
 One line, on any computer, with nothing to install first. It gets the worker from the server, sets everything up the first time (a few minutes: Python, and what vocal removal needs, a few GB, with the GPU build when there's an NVIDIA GPU) and starts it. After that, the same line starts it in seconds, with the server's latest worker.
@@ -63,6 +71,7 @@ docker run -d --restart unless-stopped --gpus all \
 | `--key` | `WORKER_KEY` | | The server's `WORKER_KEY`. |
 | `--name` | `WORKER_NAME` | the computer's name | What the server calls it. |
 | `--models-dir` | `MODELS_DIR` | `models`, in its folder | Where the models are kept between runs. |
+| `--no-songs` | `WORKER_SONGS=false` | | Only remove vocals, never make whole songs (see [Whole songs](#whole-songs)). |
 | `--gpu-memory-whisper` | `GPU_MEMORY_WHISPER_MB` | `4500` | GPU memory Whisper takes, in MB, when the server has it (its `WHISPER_MODEL`): kept free of vocal removal, so fewer songs may have their vocals removed at once (3 on a 12 GB RTX 3060, still). |
 | `--gpu-memory-per-song` | `GPU_MEMORY_PER_SONG_MB` | `2500` | GPU memory one song's vocal removal takes, in MB. Nothing about the machine is assumed: it looks at what it runs on as it starts (CPU threads, memory, each GPU and its memory free, in its log). On an NVIDIA GPU, the slots (the server's `MAX_WORKER_JOBS`) download and send back songs side by side, but only as many as the GPU's memory free then fits remove vocals at once (4 on a 12 GB RTX 3060): the others wait their turn, instead of running out of GPU memory. On a CPU (or a Mac's GPU), one at a time, as each takes every core. `0`: one for each slot, whatever it runs on. |
 
@@ -89,6 +98,15 @@ Plain HTTPS, always started by the worker. It works behind home routers, firewal
 - `POST /workers/jobs/:id/heard`: what's sung, frame by frame (a NumPy `.npy` file), when the job's `hear` says to. Before the result. The server uses it as it is: workers are trusted, so keep the key secret.
 - `POST /workers/jobs/:id/result`: the instrumental (FLAC). That ends the job.
 - `POST /workers/jobs/:id/failed` `{ error }`: couldn't, so the song goes to another worker or back to the server.
+
+A whole song (a job with `kind: 'song'`, given only to a worker that says `songs` when it asks) is:
+
+- `GET /workers/code/:file`: the server's `prepare.py`, `singing.py` and `gemini.py` (the job's `code` says which they are).
+- `GET /workers/jobs/:id/lyrics/:name`: the server's custom lyrics files (the job's `lyrics`).
+- `POST /downloaders/ask`: YouTube asked through a downloader, as `prepare.py` on the server does; what one downloads is fetched from `GET /downloaders/fetch/:id`.
+- `POST /workers/jobs/:id/lines` `{ lines: [[stream, text]] }`: what `prepare.py` says, in order.
+- `POST /workers/jobs/:id/files/:name`: each file it makes, before saying that version's ready.
+- `POST /workers/jobs/:id/exit` `{ code }`: `prepare.py` ended. That ends the job.
 
 Each needs `Authorization: Bearer <WORKER_KEY>`.
 

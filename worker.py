@@ -8,7 +8,12 @@ asks for the next: as many songs at once as the server says (its MAX_WORKER_JOBS
 of its own, so while one has its vocals taken out, the next downloads and the last is sent back
 (on an NVIDIA GPU, only as many remove vocals at once as its memory fits: GPU_MEMORY_PER_SONG_MB).
 Run as many as you like, anywhere: the server gives each song to a free one, and does it itself
-when none is free, or when one fails or goes quiet. Nothing is kept: each
+when none is free, or when one fails or goes quiet. With what the server's prepare.py needs
+installed (see requirements-gpu.txt), it makes whole songs too, when the server gives it one (its
+WORKER_SONGS): it runs the server's prepare.py here, which downloads the song (through the
+server's downloaders, then its residential proxy, then from here), finds its lyrics, matches it,
+has its vocals removed and heard by this worker's GPU, and encodes it; what's made is sent to the
+server, which only keeps it. Nothing is kept: each
 song is downloaded into this run's temporary folder and deleted once it's sent back, and the
 folder goes when the worker stops. Only the models are kept (MODELS_DIR), so they're downloaded
 once, from the server.
@@ -32,6 +37,7 @@ import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -64,9 +70,45 @@ def log(message):
     print(time.strftime('%H:%M:%S'), message, flush=True)
 
 
+# What the server's prepare.py needs to make a whole song here (see make_song): its Python
+# packages (as they're imported), ffmpeg and ffprobe, and a JavaScript runtime for yt-dlp (Deno,
+# from requirements-gpu.txt, or Node or Bun).
+SONG_MODULES = ['yt_dlp', 'yt_dlp_ejs', 'certifi', 'numpy', 'scipy', 'librosa', 'soundfile', 'audioread', 'audio_separator',
+                'unidecode', 'pypinyin', 'ToJyutping', 'taibun', 'opencc', 'cutlet', 'unidic_lite', 'korean_romanizer',
+                'torch', 'phonemizer', 'espeakng_loader', 'transformers']
+SONG_CODE = ['prepare.py', 'singing.py', 'gemini.py']  # the server's, got for each song when they change
+LINES_SECONDS = 0.5  # what prepare.py says is sent to the server this often, together
+
+
+def tools_path():
+    """PATH with this Python's own scripts folder first (a venv's: Deno, installed with pip, is
+    there), for prepare.py."""
+    return os.path.dirname(sys.executable) + os.pathsep + os.environ.get('PATH', '')
+
+
+def songs_missing():
+    """What this worker lacks to make whole songs (see make_song), in words, or None."""
+    missing = [module for module in SONG_MODULES if not importlib.util.find_spec(module)]
+    tools = [tool for tool in ('ffmpeg', 'ffprobe') if not shutil.which(tool)]
+    if not any(shutil.which(runtime, path=tools_path()) for runtime in ('deno', 'node', 'bun')):
+        tools.append('a JavaScript runtime (Deno, Node or Bun)')
+    if missing:
+        return f"the Python packages {', '.join(missing)} (see requirements-gpu.txt)"
+    if tools:
+        return ' and '.join(tools)
+    return None
+
+
 def use_ffmpeg():
     """Vocal removal writes its result with ffmpeg: the computer's own, or else the one that came
-    with the worker (imageio-ffmpeg), put in .ffmpeg here as `ffmpeg` and used from there."""
+    with the worker (imageio-ffmpeg), put in .ffmpeg here as `ffmpeg` and used from there. A
+    whole song needs ffprobe too: without the computer's, static-ffmpeg's (downloaded once)."""
+    if not (shutil.which('ffmpeg') and shutil.which('ffprobe')) and importlib.util.find_spec('static_ffmpeg'):
+        try:
+            import static_ffmpeg
+            static_ffmpeg.add_paths(weak=True)  # (only what isn't here already)
+        except Exception as error:  # vocal removal does without it
+            log(f"Couldn't get ffmpeg and ffprobe for whole songs ({str(error)[:200]})")
     if shutil.which('ffmpeg'):
         return
     import imageio_ffmpeg
@@ -475,7 +517,258 @@ def give_back(server, job, reason):
         pass  # it'll notice the silence instead
 
 
-def take_songs(server, separators, hearing, folder, me, doing, say, quit, outdated):
+class Lines:
+    """What prepare.py says, sent to the server in order (see /lines there), every LINES_SECONDS
+    together. `dropped` is set when the server doesn't want the song anymore."""
+
+    def __init__(self, server, job, dropped):
+        self.server, self.job, self.dropped = server, job, dropped
+        self.pending = []
+        self.lock = threading.Lock()  # around `pending`
+        self.sending = threading.Lock()  # one send at a time, so they arrive in order
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.keep_sending, daemon=True)
+        self.thread.start()
+
+    def add(self, stream, text):
+        with self.lock:
+            self.pending.append([stream, text])
+
+    def keep_sending(self):
+        while not self.done.wait(LINES_SECONDS):
+            self.send()
+
+    def send(self, tries=1):
+        """Sends what's waiting. Raises OSError if the server can't be reached `tries` times."""
+        with self.sending:
+            with self.lock:
+                lines, self.pending = self.pending, []
+            if not lines:
+                return
+            for attempt in range(tries):
+                try:
+                    status, _ = self.server.request('POST', f"/workers/jobs/{self.job['id']}/lines", body={'lines': lines}, timeout=30)
+                    if status == 410:
+                        self.dropped.set()
+                    return
+                except OSError:
+                    if attempt == tries - 1:
+                        with self.lock:
+                            self.pending[:0] = lines  # sent with the next
+                        raise
+                    time.sleep(RETRY_SECONDS[min(attempt, len(RETRY_SECONDS) - 1)])
+
+    def close(self):
+        """Stops sending by itself, and sends the rest (trying for a while)."""
+        self.done.set()
+        self.thread.join()
+        self.send(tries=10)
+
+
+class SongCode:
+    """The server's prepare.py, and what it loads (SONG_CODE), for each `code` it says (see
+    /workers/code there): got once, kept while the worker runs."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.lock = threading.Lock()
+
+    def get(self, server, code):
+        target = os.path.join(self.folder, re.sub(r'[^\w-]', '', code) or 'code')
+        with self.lock:
+            if not os.path.exists(os.path.join(target, 'ready')):
+                os.makedirs(target, exist_ok=True)
+                for name in SONG_CODE:
+                    if server.download(f'/workers/code/{name}', os.path.join(target, name)) != 200:
+                        raise RuntimeError(f"Couldn't get the server's {name}.")
+                open(os.path.join(target, 'ready'), 'w').close()
+        return target
+
+
+def custom_lyrics(server, job, cache, folder):
+    """The server's custom lyrics files (the job's `lyrics`), in `folder`, as they are there (with
+    when they were changed, which the server compares). Each is downloaded once, into `cache`."""
+    os.makedirs(folder, exist_ok=True)
+    os.makedirs(cache, exist_ok=True)
+    for entry in job.get('lyrics') or []:
+        name, modified = str(entry.get('name', '')), float(entry.get('modified') or 0)
+        if not name or name.startswith('.') or '/' in name or '\\' in name:
+            continue
+        kept = os.path.join(cache, f"{uuid.uuid5(uuid.NAMESPACE_URL, f'{name} {modified}')}")
+        if not os.path.exists(kept):
+            if server.download(f"/workers/jobs/{job['id']}/lyrics/{urllib.parse.quote(name)}", f'{kept}.download') != 200:
+                continue  # (changed there since: the server makes the song again, as it would)
+            os.replace(f'{kept}.download', kept)
+            os.utime(kept, (modified / 1000, modified / 1000))
+        shutil.copy2(kept, os.path.join(folder, name))
+
+
+def send_made(server, job, out, sent):
+    """The files prepare.py made so far (in `out`), sent to the server: the ones not sent yet
+    (`sent`: name -> (size, time), as they were), manifest.json last."""
+    names = sorted((name for name in os.listdir(out) if os.path.isfile(os.path.join(out, name))
+                    and not name.startswith('.') and not name.endswith('.tmp')), key=lambda name: name == 'manifest.json')
+    for name in names:
+        path = os.path.join(out, name)
+        stamp = (os.path.getsize(path), os.path.getmtime(path))
+        if sent.get(name) == stamp:
+            continue
+        status = server.upload(f"/workers/jobs/{job['id']}/files/{urllib.parse.quote(name)}", path)
+        if status == 410:
+            return False
+        if status != 204:
+            raise RuntimeError(f"The server didn't take {name} ({status}).")
+        sent[name] = stamp
+    return True
+
+
+def make_song(server, separators, hearing, job, folder, say, settings):
+    """Makes a whole song (a job of kind 'song', see sendSong in the server's workers.js): runs the
+    server's prepare.py here with the job's `args` and `env`, saying what it says to the server
+    (see Lines), and sending what it makes (see send_made) before saying each version's ready.
+    Its slow part is done by this worker, as songs sent to it are (see answer_heavy): the vocals
+    removed by one of `separators`, heard, and read with Whisper if prepare.py asks. If anything
+    goes wrong here, the song goes back to the server, which has it made again elsewhere."""
+    started = time.time()
+    tell = news_for(server, job, say)
+    stop, dropped = threading.Event(), threading.Event()
+    threading.Thread(target=keep_saying, args=(server, job, stop, dropped), daemon=True).start()
+    os.makedirs(folder, exist_ok=True)
+    process, lines = None, None
+    try:
+        code_dir = settings['code'].get(server, job['code'])
+        lyrics = os.path.join(folder, 'lyrics')
+        custom_lyrics(server, job, settings['lyrics'], lyrics)
+        out = os.path.join(folder, 'song')
+        threads = str(settings['threads'])
+        command = [sys.executable, os.path.join(code_dir, 'prepare.py'), *job['args'],
+                   f'--out={out}', f"--models-dir={settings['models']}", f'--custom-lyrics-dir={lyrics}',
+                   f'--downloader-url={server.url}/downloaders/ask', f'--threads={threads}', '--heavy-gate']
+        env = {**os.environ, **{key: str(value) for key, value in (job.get('env') or {}).items()},
+               'JAMTUBE_DOWNLOADER_TOKEN': server.key, 'PYTHONUNBUFFERED': '1', 'PATH': tools_path(),
+               'OMP_NUM_THREADS': threads, 'MKL_NUM_THREADS': threads,
+               # This worker's GPU is its own (its models stay loaded there): prepare.py's slow
+               # part is done by it (see answer_heavy), and what's left there runs on the CPU.
+               'CUDA_VISIBLE_DEVICES': ''}
+        say(f"Making {job.get('videoId')}")
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   env=env, cwd=folder, text=True, encoding='utf-8', errors='replace', bufsize=1)
+        settings['making'].add(process)
+        lines = Lines(server, job, dropped)
+
+        def read_log():
+            for line in process.stderr:
+                lines.add('err', line.rstrip('\n'))
+        log_thread = threading.Thread(target=read_log, daemon=True)
+        log_thread.start()
+
+        def end_when_dropped():
+            while process.poll() is None:
+                if dropped.wait(1):
+                    process.kill()
+                    return
+        threading.Thread(target=end_when_dropped, daemon=True).start()
+
+        heavy, sent = None, {}
+        for line in process.stdout:
+            text = line.rstrip('\n')
+            try:
+                update = json.loads(text)
+            except ValueError:
+                update = None
+            if not isinstance(update, dict):
+                lines.add('out', text)
+                continue
+            if update.get('heavy') == 'wait':
+                answer, heavy = answer_heavy(update, separators, hearing, folder, tell, settings['name'])
+                process.stdin.write(f'{answer}\n')
+                process.stdin.flush()
+            elif update.get('heavy') == 'done':
+                pass
+            elif update.get('whisper') == 'wanted':
+                if heavy and heavy[2]:
+                    threading.Thread(target=read_for_song, args=(hearing, *heavy, tell), daemon=True).start()
+            else:
+                if update.get('ready'):
+                    lines.send(tries=10)  # what it said before, first
+                    if not send_made(server, job, out, sent):
+                        dropped.set()
+                lines.add('out', text)
+                if update.get('ready'):
+                    lines.send(tries=10)
+        code = process.wait()
+        log_thread.join(timeout=10)
+        lines.close()
+        if dropped.is_set():
+            say("Stopped: it's not wanted anymore.")
+            return
+        server.request('POST', f"/workers/jobs/{job['id']}/exit", body={'code': code}, timeout=60)
+        say(f'Made it in {time.time() - started:.0f}s.' if code == 0 else f'prepare.py ended with {code}, in {time.time() - started:.0f}s.')
+    except Exception as error:  # anything at all: the server has it made elsewhere
+        if process and process.poll() is None:
+            process.kill()
+        if lines:
+            try:
+                lines.close()
+            except OSError:
+                pass
+        tell(f"Couldn't make it: {str(error)[:300]}{gpu_memory_note()}")
+        give_back(server, job, str(error)[:300])
+    finally:
+        stop.set()
+        if process:
+            if process.poll() is None:
+                process.kill()
+            settings['making'].discard(process)
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def answer_heavy(offer, separators, hearing, folder, tell, name):
+    """prepare.py's slow part (it said {"heavy": "wait", audio, separator, model, overlap, hear,
+    whisper}, see take_out_vocals there), done here as the server's songs are (see work): its
+    answer ({file, heard, whisper, worker, seconds}, or "go": it does it itself, with nothing to
+    take out), and (offer, instrumental, where Whisper's read goes, or None) for read_for_song."""
+    if not offer.get('audio'):
+        return 'go', None
+    started = time.time()
+    separator = separators.get()
+    try:
+        result = os.path.join(folder, 'instrumental.flac')
+        reset_gpu_peak()
+        shutil.move(separator.instrumental(offer, offer['audio']), result)
+        tell(f'Took the vocals out in {time.time() - started:.0f}s{gpu_memory_note(peak=True)}')
+    finally:
+        empty(separator.out_dir)
+        separators.put(separator)
+    heard = os.path.join(folder, 'heard.npy')
+    try:
+        heard = heard if hearing.hear(offer, offer['audio'], result, heard) else None
+    except Exception as error:  # prepare.py hears it itself
+        tell(f"Couldn't hear the singing ({str(error)[:300]}): it's heard on the CPU.")
+        heard = None
+    whisper = os.path.join(folder, 'whisper.json') if hearing.wants_whisper(offer) else None
+    answer = {'file': result, 'heard': heard, 'whisper': whisper, 'worker': name, 'seconds': time.time() - started}
+    return json.dumps(answer), (offer, result, whisper)
+
+
+def read_for_song(hearing, offer, instrumental, target, tell):
+    """What Whisper reads in a song being made here (prepare.py asked: the singing model wasn't
+    sure of its lyrics), saved where it waits for it (all at once, so it's never read half
+    written), with how it's going touching `target`.alive (prepare.py waits while it does)."""
+    def news(text):
+        tell(text)
+        open(f'{target}.alive', 'w').close()
+    part = f'{target}.part'
+    try:
+        hearing.read(offer, offer['audio'], instrumental, part, news)
+    except Exception as error:  # it lines the lyrics up without it
+        why = str(error).strip()[:600] or type(error).__name__
+        news(f"Couldn't read it with Whisper: {why}")
+        hearing.loaded[1].save_whisper(part, {'error': why})
+    os.replace(part, target)
+
+
+def take_songs(server, separators, hearing, folder, me, doing, say, quit, outdated, settings):
     """One slot: asks for a song, does it (see work), and asks for the next, again and again.
     `doing` is the jobs the slots are doing (so they can be given back if the worker's stopped),
     `quit(why)` stops the worker when the server won't have it, and `outdated()` says the server
@@ -504,7 +797,10 @@ def take_songs(server, separators, hearing, folder, me, doing, say, quit, outdat
             job = json.loads(body)
             doing[job['id']] = job
             try:
-                work(server, separators, hearing, job, folder, say)
+                if job.get('kind') == 'song':
+                    make_song(server, separators, hearing, job, folder, say, settings)
+                else:
+                    work(server, separators, hearing, job, folder, say)
             finally:
                 doing.pop(job['id'], None)
         elif status != 204:
@@ -612,10 +908,12 @@ def update(server, scratch):
             log(f'Installing what the update needs ({kind})')
             command = pip('install')
             cuda = CUDA_TORCH if kind == 'gpu' and command[0] != sys.executable else []
-            subprocess.run([*command, *cuda, '-r', requirements], check=True)
-            shutil.copy(requirements, mine)
-            if os.path.isdir(os.path.join(here, '.venv')):
-                shutil.copy(requirements, os.path.join(here, '.venv', 'installed'))  # so run.sh doesn't again
+            if subprocess.run([*command, *cuda, '-r', requirements]).returncode == 0:
+                shutil.copy(requirements, mine)
+                if os.path.isdir(os.path.join(here, '.venv')):
+                    shutil.copy(requirements, os.path.join(here, '.venv', 'installed'))  # so run.sh doesn't again
+            else:  # (what it can do with what's installed, it does: see songs_missing)
+                log("Couldn't install what the update needs: starting with what's installed, trying again at the next update")
         if 'worker.py' in got and not same_file(got['worker.py'], os.path.abspath(__file__)):
             os.replace(got['worker.py'], os.path.abspath(__file__))
     log('Starting again with the update.')
@@ -741,6 +1039,8 @@ def main():
                         help="Where the model is kept between runs (or MODELS_DIR; models, next to this).")
     parser.add_argument('--gpu-memory-per-song', type=int, default=int(os.environ.get('GPU_MEMORY_PER_SONG_MB') or 2500),
                         help="GPU memory one song's vocal removal takes, in MB (or GPU_MEMORY_PER_SONG_MB; 2500): on an NVIDIA GPU, only as many songs as fit have their vocals removed at once. 0: one for each slot.")
+    parser.add_argument('--no-songs', action='store_true', default=os.environ.get('WORKER_SONGS', '').lower() in ('0', 'false', 'no', 'off'),
+                        help="Only remove vocals, never make whole songs (or WORKER_SONGS=false).")
     parser.add_argument('--gpu-memory-whisper', type=int, default=int(os.environ.get('GPU_MEMORY_WHISPER_MB') or 4500),
                         help="GPU memory Whisper takes, in MB (or GPU_MEMORY_WHISPER_MB; 4500), when the server has it: kept free of vocal removal.")
     args = parser.parse_args()
@@ -767,6 +1067,7 @@ def main():
     log(f'"{args.name}" working for {server.url}, on {accelerator()}')
     log(f'This machine: {machine()}')
     doing = {}  # job id -> job: the songs the slots are doing
+    making = set()  # the prepare.py processes making whole songs here: stopped with the worker
     stop = threading.Event()
     stopped_why = []
     try:
@@ -795,6 +1096,9 @@ def main():
         log(f"The server sends up to {slots} song{'s' if slots != 1 else ''} at once; {removing} can have their vocals removed at once here"
             + (f' (about {args.gpu_memory_per_song} MB of GPU memory each, {args.gpu_memory_whisper} MB kept for Whisper)' if gpu_memory_mb() is not None and whisper
                else f' (about {args.gpu_memory_per_song} MB of GPU memory each)' if gpu_memory_mb() is not None else ' (no NVIDIA GPU: one at a time)'))
+        settings = {'code': SongCode(os.path.join(scratch, 'code')), 'lyrics': os.path.join(scratch, 'lyrics'), 'models': args.models_dir,
+                    'name': args.name, 'threads': max(1, (os.cpu_count() or 2) // slots),
+                    'making': making}
         separators = queue.Queue()
         for number in range(removing):
             separators.put(Separator(args.models_dir, os.path.join(scratch, f'out-{number}')))
@@ -811,6 +1115,17 @@ def main():
             except Exception as error:  # the first song tries again
                 log(f"Couldn't get the models ready ({str(error)[:300]}): the first song will try again.")
 
+        # Whole songs too (see make_song), when it has what they need, and hears them as the
+        # server does (its singing model's loaded here).
+        missing = None if args.no_songs else songs_missing()
+        if not args.no_songs and not missing and (hearing.loaded or setup.get('separator') == 'none'):
+            me['songs'] = True
+            log('It makes whole songs too, when the server gives it one.')
+        elif missing:
+            log(f'It only removes vocals: to make whole songs too, it needs {missing}.')
+        elif not args.no_songs:
+            log("It only removes vocals: it can't hear the singing as the server does, which whole songs need.")
+
         def quit(why):
             stopped_why.append(why)
             stop.set()
@@ -826,7 +1141,7 @@ def main():
             def say(message, slot=slot):
                 log(f'[{slot}] {message}' if slots > 1 else message)
             threads.append(threading.Thread(target=take_songs, daemon=True,
-                                            args=(server, separators, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit, outdated)))
+                                            args=(server, separators, hearing, os.path.join(scratch, f'song-{slot}'), me, doing, say, quit, outdated, settings)))
             threads[-1].start()
         while not stop.wait(1):
             if updated.is_set() and not any(thread.is_alive() for thread in threads):
@@ -836,6 +1151,8 @@ def main():
         # Stopped (Ctrl+C, docker stop, a cloud taking back its machine): the server's told about
         # each song it was doing, so they go elsewhere straight away.
         songs = list(doing.values())
+        for process in list(making):  # (whole songs': see make_song)
+            process.kill()
         for job in songs:
             give_back(server, job, 'the worker was stopped')
         log(f"Stopped: {'its song goes' if len(songs) == 1 else f'its {len(songs)} songs go'} back to the server." if songs else 'Stopped.')

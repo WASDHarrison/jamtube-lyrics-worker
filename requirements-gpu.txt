@@ -10,3 +10,24 @@ imageio-ffmpeg
 # Whisper, one more way the lyrics are lined up with the singing (the server's WHISPER_MODEL says
 # which).
 transformers
+# Whole songs (the server's WORKER_SONGS): what its prepare.py needs (its worker/requirements.txt),
+# so the worker downloads, matches and encodes songs too, not only removes their vocals. Without
+# them it only removes vocals.
+yt-dlp[default]   # includes the scripts it needs for YouTube
+deno              # the JavaScript runtime yt-dlp needs for YouTube
+static-ffmpeg     # ffmpeg and ffprobe, for computers without them (downloaded once)
+certifi
+numpy
+scipy
+librosa
+soundfile
+Unidecode
+pypinyin
+ToJyutping
+taibun
+opencc-python-reimplemented
+cutlet
+unidic-lite
+korean-romanizer
+phonemizer
+espeakng-loader
