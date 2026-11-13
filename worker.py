@@ -669,8 +669,26 @@ def make_song(server, separators, hearing, job, folder, say, settings):
                     return
         threading.Thread(target=end_when_dropped, daemon=True).start()
 
-        heavy, sent = None, {}
+        sent = {}
         wanted, ended = threading.Event(), threading.Event()  # (see read_for_song)
+        failed = []  # why the slow part couldn't be done here: the song goes back
+
+        def do_heavy(offer):
+            """prepare.py's slow part, done while what it says goes on being read (it goes on
+            finding the lyrics and the official audio meanwhile, and may end, failing, first)."""
+            try:
+                answer, heavy = answer_heavy(offer, separators, hearing, folder, tell, settings['name'])
+            except Exception as error:  # (see make_song)
+                failed.append(error)
+                process.kill()
+                return
+            try:
+                process.stdin.write(f'{answer}\n')
+                process.stdin.flush()
+            except (OSError, ValueError):
+                return  # it ended meanwhile: what it said, and its exit, say why
+            if heavy and heavy[2]:
+                threading.Thread(target=read_for_song, args=(hearing, *heavy, tell, wanted, ended), daemon=True).start()
         for line in process.stdout:
             text = line.rstrip('\n')
             try:
@@ -681,11 +699,7 @@ def make_song(server, separators, hearing, job, folder, say, settings):
                 lines.add('out', text)
                 continue
             if update.get('heavy') == 'wait':
-                answer, heavy = answer_heavy(update, separators, hearing, folder, tell, settings['name'])
-                process.stdin.write(f'{answer}\n')
-                process.stdin.flush()
-                if heavy and heavy[2]:
-                    threading.Thread(target=read_for_song, args=(hearing, *heavy, tell, wanted, ended), daemon=True).start()
+                threading.Thread(target=do_heavy, args=(update,), daemon=True).start()
             elif update.get('heavy') == 'done':
                 pass
             elif update.get('whisper') == 'wanted':
@@ -701,6 +715,8 @@ def make_song(server, separators, hearing, job, folder, say, settings):
         code = process.wait()
         ended.set()
         log_thread.join(timeout=10)
+        if failed:
+            raise failed[0]
         lines.close()
         if dropped.is_set():
             say("Stopped: it's not wanted anymore.")
