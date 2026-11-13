@@ -670,6 +670,7 @@ def make_song(server, separators, hearing, job, folder, say, settings):
         threading.Thread(target=end_when_dropped, daemon=True).start()
 
         heavy, sent = None, {}
+        wanted, ended = threading.Event(), threading.Event()  # (see read_for_song)
         for line in process.stdout:
             text = line.rstrip('\n')
             try:
@@ -683,11 +684,12 @@ def make_song(server, separators, hearing, job, folder, say, settings):
                 answer, heavy = answer_heavy(update, separators, hearing, folder, tell, settings['name'])
                 process.stdin.write(f'{answer}\n')
                 process.stdin.flush()
+                if heavy and heavy[2]:
+                    threading.Thread(target=read_for_song, args=(hearing, *heavy, tell, wanted, ended), daemon=True).start()
             elif update.get('heavy') == 'done':
                 pass
             elif update.get('whisper') == 'wanted':
-                if heavy and heavy[2]:
-                    threading.Thread(target=read_for_song, args=(hearing, *heavy, tell), daemon=True).start()
+                wanted.set()
             else:
                 if update.get('ready'):
                     lines.send(tries=10)  # what it said before, first
@@ -697,6 +699,7 @@ def make_song(server, separators, hearing, job, folder, say, settings):
                 if update.get('ready'):
                     lines.send(tries=10)
         code = process.wait()
+        ended.set()
         log_thread.join(timeout=10)
         lines.close()
         if dropped.is_set():
@@ -716,6 +719,8 @@ def make_song(server, separators, hearing, job, folder, say, settings):
         give_back(server, job, str(error)[:300])
     finally:
         stop.set()
+        if 'ended' in locals():
+            ended.set()
         if process:
             if process.poll() is None:
                 process.kill()
@@ -751,21 +756,35 @@ def answer_heavy(offer, separators, hearing, folder, tell, name):
     return json.dumps(answer), (offer, result, whisper)
 
 
-def read_for_song(hearing, offer, instrumental, target, tell):
-    """What Whisper reads in a song being made here (prepare.py asked: the singing model wasn't
-    sure of its lyrics), saved where it waits for it (all at once, so it's never read half
-    written), with how it's going touching `target`.alive (prepare.py waits while it does)."""
+def read_for_song(hearing, offer, instrumental, target, tell, wanted, ended):
+    """What Whisper reads in a song being made here, saved where prepare.py waits for it, if it
+    asks (the singing model wasn't sure of its lyrics: `wanted`), all at once, so it's never read
+    half written, with how it's going touching `target`.alive (prepare.py waits while it does).
+    Read as soon as Whisper's free, before it's asked (as songs sent back are, see read_sent),
+    so it's mostly read by then; while Whisper's reading another song, only once it's asked; and
+    not at all once the song's made (`ended`) without it."""
+    while not wanted.is_set() and hearing.whisper_lock.locked():
+        if ended.wait(0.5):
+            return
+    if ended.is_set():
+        return
+
     def news(text):
         tell(text)
         open(f'{target}.alive', 'w').close()
     part = f'{target}.part'
     try:
-        hearing.read(offer, offer['audio'], instrumental, part, news)
-    except Exception as error:  # it lines the lyrics up without it
-        why = str(error).strip()[:600] or type(error).__name__
-        news(f"Couldn't read it with Whisper: {why}")
-        hearing.loaded[1].save_whisper(part, {'error': why})
-    os.replace(part, target)
+        try:
+            hearing.read(offer, offer['audio'], instrumental, part, news)
+        except Exception as error:  # it lines the lyrics up without it
+            why = str(error).strip()[:600] or type(error).__name__
+            if ended.is_set():
+                return  # (made meanwhile, its files gone: nothing to say)
+            news(f"Couldn't read it with Whisper: {why}")
+            hearing.loaded[1].save_whisper(part, {'error': why})
+        os.replace(part, target)
+    except OSError:
+        pass  # the song's made, and its folder gone
 
 
 def take_songs(server, separators, hearing, folder, me, doing, say, quit, outdated, settings):
